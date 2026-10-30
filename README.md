@@ -157,7 +157,17 @@ row. Full-table iteration scans allocated slots, including holes. Iteration orde
 is unspecified.
 
 Rows occupy reusable slots maintained by a free list. Removing one row never
-shifts another row's ID. Generational IDs contain the configured slot integer
+shifts another row's ID. The macro selects separate generational or
+non-generational arena implementations at compile time. Occupancy is stored in
+a `bitvec` bitmap, using one bit per allocated slot. A slot is a union of the row
+and a one-word free-list link, so vacant slots do not reserve additional link
+space alongside a row. Only the generational arena stores a separate `u64`
+generation vector; the non-generational arena has no generation metadata or
+generation checks. Unsafe union access is confined to the shared slot-storage
+module, which owns occupancy tracking and drops each live row exactly once,
+including cleanup after a row destructor panics.
+
+Generational IDs contain the configured slot integer
 and a separate `u64` generation; a removed ID cannot access its replacement. A
 slot is permanently retired if its generation counter is exhausted. Without
 generations, an ID contains only the configured integer, and an old ID can refer
@@ -176,3 +186,10 @@ references are outside the current API.
 
 Run the checks with `cargo test --workspace`, `cargo fmt --all --check`, and
 `cargo clippy --workspace --all-targets -- -D warnings`.
+
+The arena tests also pass with
+`MIRIFLAGS=-Zmiri-tree-borrows cargo +nightly miri test -p minitable --lib`.
+With `bitvec` 1.1.1, default Miri reports a Stacked Borrows violation inside
+`BitVec::push`, independently reproducible without an arena. Tree Borrows passes
+the arena tests, but `bitvec` still emits an integer-to-pointer provenance
+warning, which limits Miri's validation coverage.

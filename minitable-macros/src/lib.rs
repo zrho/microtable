@@ -548,6 +548,11 @@ fn expand(args: TokenStream2, mut row: ItemStruct) -> syn::Result<TokenStream2> 
         }
     }
     let generation_field = generational.then(|| quote!(generation: u64,));
+    let arena = if generational {
+        quote!(#runtime::__private::GenerationalArena)
+    } else {
+        quote!(#runtime::__private::NonGenerationalArena)
+    };
     let generation_init = generational.then(|| quote!(generation,));
     let generation_read = if generational {
         quote!(self.generation)
@@ -577,7 +582,6 @@ fn expand(args: TokenStream2, mut row: ItemStruct) -> syn::Result<TokenStream2> 
 
         #(#cfg)*
         impl #runtime::__private::RowId for #id {
-            const GENERATIONAL: bool = #generational;
             fn from_parts(index: usize, generation: u64) -> ::std::option::Option<Self> {
                 let _ = generation;
                 ::std::option::Option::Some(Self { index: <#index_type as ::std::convert::TryFrom<usize>>::try_from(index).ok()?, #generation_init })
@@ -596,7 +600,7 @@ fn expand(args: TokenStream2, mut row: ItemStruct) -> syn::Result<TokenStream2> 
         #(#cfg)*
         #[doc = "A table with stable row IDs and generated indexes. Mutation is through checked replacement."]
         #vis struct #table #table_generics #table_where {
-            __rows: #runtime::__private::Arena<#entry #row_args, #id>,
+            __rows: #arena<#entry #row_args, #id>,
             #(#map_fields,)*
         }
 
