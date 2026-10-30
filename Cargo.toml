@@ -1,0 +1,3 @@
+[workspace]
+members = ["minitable", "minitable-macros"]
+resolver = "2"

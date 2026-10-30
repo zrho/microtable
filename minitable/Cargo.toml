@@ -1,0 +1,10 @@
+[package]
+name = "minitable"
+version = "0.1.0"
+edition = "2024"
+description = "Generated tables with stable row IDs and field indexes"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+hashbrown = { version = "0.17", default-features = false, features = ["inline-more", "raw-entry"] }
+minitable-macros = { path = "../minitable-macros", version = "0.1.0" }
