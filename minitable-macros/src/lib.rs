@@ -10,6 +10,8 @@ use syn::{Fields, ItemStruct, ext::IdentExt, parse::Parser, parse_macro_input, s
 ///
 /// Options: `table = Name`, `id = Name`, `index_type = u32`, and
 /// `generational = false`. Field attributes: `#[indexed(unique)]` or `#[indexed(many)]`.
+/// Named struct attributes: `#[index(name = pair, unique, fields(a, b))]` or
+/// `#[index(name = derived, many, key_type = String, key = compute_key)]`.
 #[proc_macro_attribute]
 pub fn table(args: TokenStream, input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as ItemStruct);
@@ -22,6 +24,160 @@ pub fn table(args: TokenStream, input: TokenStream) -> TokenStream {
 enum Kind {
     Unique,
     Many,
+}
+
+enum IndexKey {
+    Fields(Vec<(syn::Ident, syn::Type)>),
+    Computed {
+        ty: Box<syn::Type>,
+        expression: Box<syn::Expr>,
+    },
+}
+
+struct Index {
+    name: syn::Ident,
+    kind: Kind,
+    key: IndexKey,
+}
+
+impl Index {
+    fn types(&self) -> Vec<&syn::Type> {
+        match &self.key {
+            IndexKey::Fields(fields) => fields.iter().map(|(_, ty)| ty).collect(),
+            IndexKey::Computed { ty, .. } => vec![ty],
+        }
+    }
+
+    fn key_type(&self) -> TokenStream2 {
+        let types = self.types();
+        if types.len() == 1 {
+            let ty = types[0];
+            quote!(#ty)
+        } else {
+            quote!((#(#types,)*))
+        }
+    }
+
+    // Tuple references hash identically to owned tuples without cloning components.
+    fn borrowed(&self, row: &TokenStream2, computed: &TokenStream2) -> TokenStream2 {
+        match &self.key {
+            IndexKey::Computed { .. } => quote!(&#computed),
+            IndexKey::Fields(fields) if fields.len() == 1 => {
+                let field = &fields[0].0;
+                quote!(&#row.#field)
+            }
+            IndexKey::Fields(fields) => {
+                let fields = fields.iter().map(|(field, _)| field);
+                quote!(&(#(&#row.#fields,)*))
+            }
+        }
+    }
+
+    fn equivalent(&self, row: &TokenStream2, computed: &TokenStream2) -> TokenStream2 {
+        match &self.key {
+            IndexKey::Fields(fields) if fields.len() > 1 => {
+                let comparisons = fields.iter().enumerate().map(|(i, (field, _))| {
+                    let i = syn::Index::from(i);
+                    quote!(::std::cmp::PartialEq::eq(&__stored_key.#i, &#row.#field))
+                });
+                quote!(#(#comparisons)&&*)
+            }
+            _ => {
+                let borrowed = self.borrowed(row, computed);
+                quote!(::std::cmp::PartialEq::eq(__stored_key, #borrowed))
+            }
+        }
+    }
+
+    fn cloned(&self, row: &TokenStream2, computed: &TokenStream2) -> TokenStream2 {
+        match &self.key {
+            IndexKey::Fields(fields) if fields.len() > 1 => {
+                let fields = fields.iter().map(|(field, _)| field);
+                quote!((#(::std::clone::Clone::clone(&#row.#fields),)*))
+            }
+            _ => {
+                let borrowed = self.borrowed(row, computed);
+                quote!(::std::clone::Clone::clone(#borrowed))
+            }
+        }
+    }
+}
+
+fn parse_index(attr: &syn::Attribute, fields: &syn::FieldsNamed) -> syn::Result<Index> {
+    let mut name = None;
+    let mut kind = None;
+    let mut selected_fields = None;
+    let mut key_type = None;
+    let mut expression = None;
+    let mut seen = std::collections::HashSet::new();
+    attr.parse_nested_meta(|meta| {
+        let option = meta
+            .path
+            .get_ident()
+            .ok_or_else(|| meta.error("expected an index option"))?
+            .to_string();
+        if !seen.insert(option.clone()) {
+            return Err(meta.error("duplicate index option"));
+        }
+        match option.as_str() {
+            "name" => name = Some(meta.value()?.parse::<syn::Ident>()?),
+            "unique" | "many" => {
+                if kind.is_some() {
+                    return Err(meta.error("choose either unique or many"));
+                }
+                kind = Some(if option == "unique" {
+                    Kind::Unique
+                } else {
+                    Kind::Many
+                });
+            }
+            "fields" => {
+                let content;
+                syn::parenthesized!(content in meta.input);
+                selected_fields =
+                    Some(content.parse_terminated(syn::Ident::parse_any, syn::Token![,])?);
+            }
+            "key_type" => key_type = Some(meta.value()?.parse::<syn::Type>()?),
+            "key" => expression = Some(meta.value()?.parse::<syn::Expr>()?),
+            _ => return Err(meta.error("expected name, unique, many, fields, key_type, or key")),
+        }
+        Ok(())
+    })?;
+    let name =
+        name.ok_or_else(|| syn::Error::new(attr.span(), "index requires name = identifier"))?;
+    let kind = kind.ok_or_else(|| syn::Error::new(attr.span(), "index requires unique or many"))?;
+    let key = match (selected_fields, key_type, expression) {
+        (Some(selected), None, None) => {
+            if selected.is_empty() {
+                return Err(syn::Error::new(attr.span(), "fields must not be empty"));
+            }
+            let mut seen = std::collections::HashSet::new();
+            let mut result = Vec::new();
+            for field in selected {
+                if !seen.insert(field.unraw().to_string()) {
+                    return Err(syn::Error::new(field.span(), "duplicate field in index"));
+                }
+                let definition = fields
+                    .named
+                    .iter()
+                    .find(|definition| definition.ident.as_ref() == Some(&field))
+                    .ok_or_else(|| syn::Error::new(field.span(), "unknown field in index"))?;
+                result.push((field, definition.ty.clone()));
+            }
+            IndexKey::Fields(result)
+        }
+        (None, Some(ty), Some(expression)) => IndexKey::Computed {
+            ty: Box::new(ty),
+            expression: Box::new(expression),
+        },
+        _ => {
+            return Err(syn::Error::new(
+                attr.span(),
+                "specify either fields(...) or both key_type = Type and key = function_or_closure",
+            ));
+        }
+    };
+    Ok(Index { name, kind, key })
 }
 
 // Only propagate conditional compilation, not derives or representation attributes.
@@ -142,7 +298,27 @@ fn expand(args: TokenStream2, mut row: ItemStruct) -> syn::Result<TokenStream2> 
         }
         field.attrs = retained;
         if let Some(kind) = kind {
-            indexes.push((field.ident.clone().unwrap(), field.ty.clone(), kind));
+            let field_name = field.ident.clone().unwrap();
+            indexes.push(Index {
+                name: field_name.clone(),
+                kind,
+                key: IndexKey::Fields(vec![(field_name, field.ty.clone())]),
+            });
+        }
+    }
+    let mut retained = Vec::new();
+    for attr in std::mem::take(&mut row.attrs) {
+        if attr.path().is_ident("index") {
+            indexes.push(parse_index(&attr, fields)?);
+        } else {
+            retained.push(attr);
+        }
+    }
+    row.attrs = retained;
+    let mut index_names = std::collections::HashSet::new();
+    for index in &indexes {
+        if !index_names.insert(index.name.unraw().to_string()) {
+            return Err(syn::Error::new(index.name.span(), "duplicate index name"));
         }
     }
     let runtime = match proc_macro_crate::crate_name("minitable") {
@@ -163,19 +339,24 @@ fn expand(args: TokenStream2, mut row: ItemStruct) -> syn::Result<TokenStream2> 
     let original_generics = &row.generics;
     let (_, row_args, row_where) = original_generics.split_for_impl();
     let mut table_generics = row.generics.clone();
-    for (_, ty, _) in &indexes {
-        table_generics
-            .make_where_clause()
-            .predicates
-            .push(syn::parse_quote!(
-                #ty: ::std::clone::Clone + ::std::cmp::Eq + ::std::hash::Hash
-            ));
+    for index in &indexes {
+        for ty in index.types() {
+            table_generics
+                .make_where_clause()
+                .predicates
+                .push(syn::parse_quote!(
+                    #ty: ::std::clone::Clone + ::std::cmp::Eq + ::std::hash::Hash
+                ));
+        }
     }
     let (impl_generics, type_generics, table_where) = table_generics.split_for_impl();
     let mut map_fields = Vec::new();
     let mut map_defaults = Vec::new();
     let mut link_fields = Vec::new();
     let mut link_defaults = Vec::new();
+    let mut computed_fields = Vec::new();
+    let mut compute_keys = Vec::new();
+    let mut computed_defaults = Vec::new();
     let mut checks_insert = Vec::new();
     let mut checks_replace = Vec::new();
     let mut clone_insert_keys = Vec::new();
@@ -186,19 +367,88 @@ fn expand(args: TokenStream2, mut row: ItemStruct) -> syn::Result<TokenStream2> 
     let mut detach = Vec::new();
     let mut detach_many = Vec::new();
     let mut lookups = Vec::new();
-    for (field, ty, kind) in &indexes {
+    for index in &indexes {
+        let field = &index.name;
+        let ty = index.key_type();
+        let kind = &index.kind;
         let map = format_ident!("__index_{}", field.unraw());
         let key = format_ident!("__key_{}", field.unraw());
         let unique_entry = format_ident!("__entry_{}", field.unraw());
         let hash = format_ident!("__hash_{}", field.unraw());
         let links = format_ident!("__links_{}", field.unraw());
-        map_fields.push(quote!(#map: #runtime::__private::HashMap<#ty, #id>));
+        let computed = format_ident!("__computed_{}", field.unraw());
+        if let IndexKey::Computed { ty, expression } = &index.key {
+            computed_fields.push(quote!(#computed: #ty));
+            computed_defaults.push(quote!(#computed));
+            compute_keys.push(quote! {
+                let #computed: #ty = {
+                    let __compute_key: fn(&#name #row_args) -> #ty = #expression;
+                    __compute_key(&row)
+                };
+            });
+        }
+        let borrowed = index.borrowed(&quote!(row), &quote!(#computed));
+        let equivalent = index.equivalent(&quote!(row), &quote!(#computed));
+        let cloned = index.cloned(&quote!(row), &quote!(#computed));
+        let old_borrowed = index.borrowed(&quote!(old.row), &quote!(old.#computed));
+        let old_equivalent = index.equivalent(&quote!(old.row), &quote!(old.#computed));
+        let old_entry = quote! {
+            let __old_hash = ::std::hash::BuildHasher::hash_one(self.#map.hasher(), #old_borrowed);
+            let __old_entry = #runtime::__private::RawEntryApiV1::raw_entry_mut_v1(&mut self.#map)
+                .from_hash(__old_hash, |__stored_key| #old_equivalent);
+        };
+        let remove_old = quote! {
+            #old_entry
+            match __old_entry {
+                #runtime::__private::RawEntryMut::Occupied(entry) => { entry.swap_remove(); }
+                #runtime::__private::RawEntryMut::Vacant(_) => ::std::unreachable!("present index"),
+            }
+        };
+        let (query_generics, query_arguments, query_bounds, find) = match &index.key {
+            IndexKey::Fields(fields) if fields.len() > 1 => {
+                let queries: Vec<_> = (0..fields.len())
+                    .map(|i| format_ident!("__MinitableQuery{i}"))
+                    .collect();
+                let arguments: Vec<_> = (0..fields.len())
+                    .map(|i| format_ident!("__value_{i}"))
+                    .collect();
+                let parameters = queries
+                    .iter()
+                    .zip(&arguments)
+                    .map(|(query, argument)| quote!(#argument: &#query));
+                let bounds = fields.iter().zip(&queries).map(|((_, ty), query)| quote!(
+                    #ty: ::std::borrow::Borrow<#query>, #query: ::std::hash::Hash + ::std::cmp::Eq
+                ));
+                let comparisons = queries.iter().zip(&arguments).enumerate().map(|(i, (query, argument))| {
+                    let i = syn::Index::from(i);
+                    quote!(::std::borrow::Borrow::<#query>::borrow(&__stored_key.#i) == #argument)
+                });
+                (
+                    quote!(#(#queries: ?::std::marker::Sized),*),
+                    quote!(#(#parameters),*),
+                    quote!(#(#bounds),*),
+                    quote!({
+                        let __hash = ::std::hash::BuildHasher::hash_one(self.#map.hasher(), (#(#arguments,)*));
+                        #runtime::__private::RawEntryApiV1::raw_entry_v1(&self.#map)
+                            .from_hash(__hash, |__stored_key| #(#comparisons)&&*)
+                            .map(|(_, id)| *id)
+                    }),
+                )
+            }
+            _ => (
+                quote!(__MinitableQuery: ?::std::marker::Sized),
+                quote!(value: &__MinitableQuery),
+                quote!(#ty: ::std::borrow::Borrow<__MinitableQuery>, __MinitableQuery: ::std::hash::Hash + ::std::cmp::Eq),
+                quote!(self.#map.get(value).copied()),
+            ),
+        };
+        map_fields.push(quote!(#map: #runtime::__private::IndexMap<#ty, #id>));
         map_defaults.push(quote!(#map: ::std::default::Default::default()));
         match kind {
             Kind::Unique => {
                 checks_insert.push(quote! {
-                    let #hash = ::std::hash::BuildHasher::hash_one(self.#map.hasher(), &row.#field);
-                    let #unique_entry = match self.#map.raw_entry_mut().from_key_hashed_nocheck(#hash, &row.#field) {
+                    let #hash = ::std::hash::BuildHasher::hash_one(self.#map.hasher(), #borrowed);
+                    let #unique_entry = match #runtime::__private::RawEntryApiV1::raw_entry_mut_v1(&mut self.#map).from_hash(#hash, |__stored_key| #equivalent) {
                         #runtime::__private::RawEntryMut::Vacant(entry) => entry,
                         #runtime::__private::RawEntryMut::Occupied(_) => {
                             return ::std::result::Result::Err(#runtime::InsertError { row, kind: #runtime::InsertErrorKind::Unique { field: ::std::stringify!(#field) } });
@@ -206,18 +456,18 @@ fn expand(args: TokenStream2, mut row: ItemStruct) -> syn::Result<TokenStream2> 
                     };
                 });
                 checks_replace.push(quote! {
-                    let #hash = ::std::hash::BuildHasher::hash_one(self.#map.hasher(), &row.#field);
-                    let #unique_entry = match self.#map.raw_entry_mut().from_key_hashed_nocheck(#hash, &row.#field) {
+                    let #hash = ::std::hash::BuildHasher::hash_one(self.#map.hasher(), #borrowed);
+                    let #unique_entry = match #runtime::__private::RawEntryApiV1::raw_entry_mut_v1(&mut self.#map).from_hash(#hash, |__stored_key| #equivalent) {
                         #runtime::__private::RawEntryMut::Occupied(entry) if *entry.get() != id => {
                             return ::std::result::Result::Err(#runtime::ReplaceError { row, kind: #runtime::ReplaceErrorKind::Unique { field: ::std::stringify!(#field) } });
                         }
                         entry => entry,
                     };
                 });
-                clone_insert_keys.push(quote!(let #key = ::std::clone::Clone::clone(&row.#field);));
+                clone_insert_keys.push(quote!(let #key = #cloned;));
                 clone_replace_keys.push(quote! {
                     let #key = match &#unique_entry {
-                        #runtime::__private::RawEntryMut::Vacant(_) => ::std::option::Option::Some(::std::clone::Clone::clone(&row.#field)),
+                        #runtime::__private::RawEntryMut::Vacant(_) => ::std::option::Option::Some(#cloned),
                         #runtime::__private::RawEntryMut::Occupied(_) => ::std::option::Option::None,
                     };
                 });
@@ -230,23 +480,23 @@ fn expand(args: TokenStream2, mut row: ItemStruct) -> syn::Result<TokenStream2> 
                         #runtime::__private::RawEntryMut::Occupied(_) => {}
                         #runtime::__private::RawEntryMut::Vacant(entry) => {
                             entry.insert_hashed_nocheck(#hash, #key.expect("cloned vacant key"), id);
-                            self.#map.remove(&old.row.#field);
+                            #remove_old
                         }
                     }
                 });
-                detach.push(quote!(self.#map.remove(&old.row.#field);));
+                detach.push(remove_old);
                 let method = format_ident!("get_by_{}", field.unraw());
                 lookups.push(quote! {
                     /// Find a row through a unique index. Supports borrowed keys such as `str`.
-                    #vis fn #method<__MinitableQuery: ?::std::marker::Sized>(&self, value: &__MinitableQuery) -> ::std::option::Option<(#id, &#name #row_args)>
-                    where #ty: ::std::borrow::Borrow<__MinitableQuery>, __MinitableQuery: ::std::hash::Hash + ::std::cmp::Eq {
-                        let id = *self.#map.get(value)?;
+                    #vis fn #method<#query_generics>(&self, #query_arguments) -> ::std::option::Option<(#id, &#name #row_args)>
+                    where #query_bounds {
+                        let id = #find?;
                         self.get(id).map(|row| (id, row))
                     }
                 });
             }
             Kind::Many => {
-                let clone_key = quote!(let #key = ::std::clone::Clone::clone(&row.#field););
+                let clone_key = quote!(let #key = #cloned;);
                 clone_insert_keys.push(clone_key.clone());
                 clone_replace_keys.push(clone_key);
                 link_fields.push(quote!(#links: #runtime::__private::Links<#id>));
@@ -261,10 +511,18 @@ fn expand(args: TokenStream2, mut row: ItemStruct) -> syn::Result<TokenStream2> 
                 let unlink = quote! {
                     if let ::std::option::Option::Some(prev) = old.#links.prev {
                         self.__rows.get_mut(prev).expect("present predecessor").#links.next = old.#links.next;
-                    } else if let ::std::option::Option::Some(next) = old.#links.next {
-                        *self.#map.get_mut(&old.row.#field).expect("present index") = next;
                     } else {
-                        self.#map.remove(&old.row.#field);
+                        #old_entry
+                        match __old_entry {
+                            #runtime::__private::RawEntryMut::Occupied(mut entry) => {
+                                if let ::std::option::Option::Some(next) = old.#links.next {
+                                    *entry.get_mut() = next;
+                                } else {
+                                    entry.swap_remove();
+                                }
+                            }
+                            #runtime::__private::RawEntryMut::Vacant(_) => ::std::unreachable!("present index"),
+                        }
                     }
                     if let ::std::option::Option::Some(next) = old.#links.next {
                         self.__rows.get_mut(next).expect("present successor").#links.prev = old.#links.prev;
@@ -275,9 +533,9 @@ fn expand(args: TokenStream2, mut row: ItemStruct) -> syn::Result<TokenStream2> 
                 let method = format_ident!("iter_by_{}", field.unraw());
                 lookups.push(quote! {
                     /// Iterate over matching rows in unspecified order using the intrusive list.
-                    #vis fn #method<__MinitableQuery: ?::std::marker::Sized>(&self, value: &__MinitableQuery) -> impl ::std::iter::Iterator<Item = (#id, &#name #row_args)> + '_
-                    where #ty: ::std::borrow::Borrow<__MinitableQuery>, __MinitableQuery: ::std::hash::Hash + ::std::cmp::Eq {
-                        let mut next = self.#map.get(value).copied();
+                    #vis fn #method<#query_generics>(&self, #query_arguments) -> impl ::std::iter::Iterator<Item = (#id, &#name #row_args)> + '_
+                    where #query_bounds {
+                        let mut next = #find;
                         ::std::iter::from_fn(move || {
                             let id = next?;
                             let entry = self.__rows.get(id).expect("present indexed row");
@@ -332,6 +590,7 @@ fn expand(args: TokenStream2, mut row: ItemStruct) -> syn::Result<TokenStream2> 
         struct #entry #original_generics #row_where {
             row: #name #row_args,
             #(#link_fields,)*
+            #(#computed_fields,)*
         }
 
         #(#cfg)*
@@ -368,12 +627,13 @@ fn expand(args: TokenStream2, mut row: ItemStruct) -> syn::Result<TokenStream2> 
             }
             /// Insert a row after checking every unique index. Errors preserve the row.
             #vis fn insert(&mut self, row: #name #row_args) -> ::std::result::Result<#id, #runtime::InsertError<#name #row_args>> {
+                #(#compute_keys)*
                 #(#checks_insert)*
                 if !self.__rows.can_insert() {
                     return ::std::result::Result::Err(#runtime::InsertError { row, kind: #runtime::InsertErrorKind::CapacityExhausted });
                 }
                 #(#clone_insert_keys)*
-                let entry = #entry { row, #(#link_defaults,)* };
+                let entry = #entry { row, #(#link_defaults,)* #(#computed_defaults,)* };
                 let id = match self.__rows.insert(entry) {
                     ::std::result::Result::Ok(id) => id,
                     ::std::result::Result::Err(entry) => return ::std::result::Result::Err(#runtime::InsertError { row: entry.row, kind: #runtime::InsertErrorKind::CapacityExhausted }),
@@ -388,9 +648,10 @@ fn expand(args: TokenStream2, mut row: ItemStruct) -> syn::Result<TokenStream2> 
                 if !self.contains(id) {
                     return ::std::result::Result::Err(#runtime::ReplaceError { row, kind: #runtime::ReplaceErrorKind::NotFound });
                 }
+                #(#compute_keys)*
                 #(#checks_replace)*
                 #(#clone_replace_keys)*
-                let entry = #entry { row, #(#link_defaults,)* };
+                let entry = #entry { row, #(#link_defaults,)* #(#computed_defaults,)* };
                 let old = ::std::mem::replace(self.__rows.get_mut(id).expect("present row"), entry);
                 #(#commit_replace)*
                 #(#detach_many)*
@@ -467,6 +728,113 @@ mod tests {
                     struct Row {}
                 ),
                 "expected table",
+            ),
+            (
+                quote!(),
+                quote!(
+                    #[index(unique, fields(a))]
+                    struct Row {
+                        a: u32,
+                    }
+                ),
+                "requires name",
+            ),
+            (
+                quote!(),
+                quote!(
+                    #[index(name = pair, fields(a))]
+                    struct Row {
+                        a: u32,
+                    }
+                ),
+                "requires unique or many",
+            ),
+            (
+                quote!(),
+                quote!(
+                    #[index(name = pair, unique, many, fields(a))]
+                    struct Row {
+                        a: u32,
+                    }
+                ),
+                "either unique or many",
+            ),
+            (
+                quote!(),
+                quote!(
+                    #[index(name = pair, unique, fields())]
+                    struct Row {}
+                ),
+                "must not be empty",
+            ),
+            (
+                quote!(),
+                quote!(
+                    #[index(name = pair, unique, fields(missing))]
+                    struct Row {
+                        a: u32,
+                    }
+                ),
+                "unknown field",
+            ),
+            (
+                quote!(),
+                quote!(
+                    #[index(name = pair, unique, fields(a, a))]
+                    struct Row {
+                        a: u32,
+                    }
+                ),
+                "duplicate field",
+            ),
+            (
+                quote!(),
+                quote!(
+                    #[index(name = pair, unique, key = compute)]
+                    struct Row {}
+                ),
+                "both key_type",
+            ),
+            (
+                quote!(),
+                quote!(
+                    #[index(name = pair, unique, fields(a), key_type = u32, key = compute)]
+                    struct Row {
+                        a: u32,
+                    }
+                ),
+                "either fields",
+            ),
+            (
+                quote!(),
+                quote!(
+                    #[index(name = a, many, fields(a))]
+                    struct Row {
+                        #[indexed(unique)]
+                        a: u32,
+                    }
+                ),
+                "duplicate index name",
+            ),
+            (
+                quote!(),
+                quote!(
+                    #[index(name = a, name = b, unique, fields(a))]
+                    struct Row {
+                        a: u32,
+                    }
+                ),
+                "duplicate index option",
+            ),
+            (
+                quote!(),
+                quote!(
+                    #[index(name = a, unique, unknown)]
+                    struct Row {
+                        a: u32,
+                    }
+                ),
+                "expected name",
             ),
         ] {
             let error = expand(args, syn::parse2(item).unwrap()).unwrap_err();

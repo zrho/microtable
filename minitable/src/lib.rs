@@ -16,6 +16,21 @@
 //! people.remove(id);
 //! assert!(people.get(id).is_none());
 //! ```
+//!
+//! Named indexes can combine fields or compute a key:
+//!
+//! ```
+//! #[minitable::table]
+//! #[index(name = tenant_name, unique, fields(tenant, name))]
+//! #[index(name = normalized, many, key_type = String,
+//!         key = |row| row.name.to_ascii_lowercase())]
+//! #[derive(Debug)]
+//! struct User { tenant: u32, name: String }
+//! let mut users = UserTable::new();
+//! let id = users.insert(User { tenant: 1, name: "Ada".into() }).unwrap();
+//! assert_eq!(users.get_by_tenant_name(&1, "Ada").unwrap().0, id);
+//! assert_eq!(users.iter_by_normalized("ada").next().unwrap().0, id);
+//! ```
 #![forbid(unsafe_code)]
 
 pub use minitable_macros::table;
@@ -77,8 +92,8 @@ impl<T: std::fmt::Debug> std::error::Error for ReplaceError<T> {}
 pub mod __private {
     use std::marker::PhantomData;
 
-    pub use hashbrown::hash_map::RawEntryMut;
-    pub type HashMap<K, V> = hashbrown::HashMap<K, V, std::hash::RandomState>;
+    pub use indexmap::IndexMap;
+    pub use indexmap::map::{RawEntryApiV1, raw_entry_v1::RawEntryMut};
 
     pub trait RowId: Copy + Eq {
         const GENERATIONAL: bool;

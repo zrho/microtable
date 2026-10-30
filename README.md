@@ -84,18 +84,68 @@ Indexed fields require `Clone + Eq + Hash`. Non-indexed fields have no additiona
 bounds. Lookups support borrowed keys through `Borrow`, such as a `str` lookup
 against a `String` field. Row access is immutable; change rows through `replace`.
 
+Declare named indexes on the struct to combine fields or compute keys:
+
+```rust
+#[minitable::table]
+#[index(name = tenant_email, unique, fields(tenant, email))]
+#[index(name = tenant_team, many, fields(tenant, team))]
+#[index(name = normalized_email, unique, key_type = String,
+        key = |row| format!("{}:{}", row.tenant, row.email.to_ascii_lowercase()))]
+#[derive(Debug)]
+struct Account {
+    tenant: u32,
+    email: String,
+    team: String,
+}
+
+let mut accounts = AccountTable::new();
+let id = accounts.insert(Account {
+    tenant: 1,
+    email: "Ada@example.com".into(),
+    team: "engineering".into(),
+}).unwrap();
+assert_eq!(accounts.get_by_tenant_email(&1, "Ada@example.com").unwrap().0, id);
+assert_eq!(accounts.iter_by_tenant_team(&1, "engineering").count(), 1);
+assert_eq!(accounts.get_by_normalized_email("1:ada@example.com").unwrap().0, id);
+```
+
+Named indexes support both `unique` and `many`, and coexist with field attributes.
+Names must be distinct from every other index name, including field indexes.
+`fields(...)` accepts one or more distinct field names; several fields are stored
+as a tuple key. Composite lookups take one borrowed argument per field, in the
+declared order, with no heap allocation or component clones. Each component
+requires `Clone + Eq + Hash`.
+
+Computed indexes require an explicit `key_type` and a `key` function path or
+non-capturing closure, coerced to `fn(&Row) -> Key`. Only the resulting key type
+needs `Clone + Eq + Hash`; source fields need no additional bounds. Computations
+should be deterministic functions of the row. Each result is evaluated once per
+attempted write that reaches index validation and cached in the private wrapper.
+Removal and lookup do not rerun computations. Keys may borrow data with an
+existing row lifetime, but cannot borrow from the row's owned fields. A computed
+tuple key is queried using a reference to that tuple; separate borrowed arguments
+are generated for `fields(...)` declarations.
+
 Insertion errors expose the rejected `row` and a `kind`:
 `InsertErrorKind::Unique { field }` or `InsertErrorKind::CapacityExhausted`.
 Replacement errors similarly expose the rejected row, with
 `ReplaceErrorKind::Unique { field }` or `ReplaceErrorKind::NotFound`.
+For a named index, `field` contains the index name. Field indexes are validated
+in field order, then named indexes in declaration order.
 Every returned error leaves the table unchanged. Replacements can keep their
 own unique values. Error types implement `Debug` when the row does, so using
 `unwrap()` on a write result requires a `Debug` row.
 
-Indexes use `hashbrown` maps with `std::hash::RandomState`. Unique constraints
+Indexes use `indexmap::IndexMap` with `std::hash::RandomState`. Unique constraints
 are checked through borrowed raw entries, retaining the computed hash for
 insertion. Keys are cloned only after all checks pass; replacements also skip
-cloning unchanged unique keys. Rejected writes do not clone index keys.
+cloning unchanged unique keys. Generated code does not clone index keys on
+rejected writes; user-provided computed-key functions may themselves allocate
+or clone while producing their result.
+Index entries use `swap_remove` for expected constant-time deletion; their
+positions are independent of the arena-based row IDs. Iteration order remains
+unspecified.
 
 Each many index stores a hash map from a distinct field value to a list head.
 The doubly linked list's previous/next IDs live in a private wrapper around each
@@ -120,9 +170,9 @@ hash/equality behavior while stored, including through interior mutability.
 User-defined hashing, equality, and cloning should not panic; table consistency
 after a panic in those operations is not guaranteed.
 
-The initial API supports named-field structs and single-field indexes.
-Conditionally compiled fields are rejected. Composite indexes, serialization,
-and mutable row references are outside the current API.
+The API supports named-field structs with field, composite, and computed indexes.
+Conditionally compiled fields are rejected. Serialization and mutable row
+references are outside the current API.
 
 Run the checks with `cargo test --workspace`, `cargo fmt --all --check`, and
 `cargo clippy --workspace --all-targets -- -D warnings`.

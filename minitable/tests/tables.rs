@@ -220,6 +220,83 @@ fn exhausted_capacity_does_not_clone_keys() {
     assert_eq!(table.get_by_first(&256).unwrap().0, reused);
 }
 
+#[table]
+#[index(name = pair, unique, fields(first, second))]
+#[index(name = computed, unique, key_type = CountedKey, key = |row| counted_output(&row.derived))]
+#[index(name = computed_group, many, key_type = CountedKey, key = |row| counted_output(&row.group))]
+#[derive(Debug)]
+struct NamedCountedRow {
+    first: CountedKey,
+    second: CountedKey,
+    derived: CountedKey,
+    group: CountedKey,
+}
+
+// Materialize a computed output without calling the instrumented key's Clone.
+fn counted_output(key: &CountedKey) -> CountedKey {
+    CountedKey {
+        value: key.value,
+        hashes: key.hashes.clone(),
+        clones: key.clones.clone(),
+    }
+}
+
+impl NamedCountedRow {
+    fn new(first: u32, second: u32, derived: u32, group: u32) -> Self {
+        Self {
+            first: CountedKey::new(first),
+            second: CountedKey::new(second),
+            derived: CountedKey::new(derived),
+            group: CountedKey::new(group),
+        }
+    }
+}
+
+#[test]
+fn named_indexes_preserve_hash_and_clone_optimizations() {
+    let mut table = NamedCountedRowTable::new();
+    let row = NamedCountedRow::new(1, 2, 10, 5);
+    let counters = [&row.first, &row.second, &row.derived, &row.group]
+        .map(|key| (key.hashes.clone(), key.clones.clone()));
+    let id = table.insert(row).unwrap();
+    for (hashes, clones) in counters {
+        assert_eq!(hashes.get(), 1);
+        assert_eq!(clones.get(), 1);
+    }
+    // A composite conflict and a later computed-key conflict both defer all cloning.
+    for (row, index) in [
+        (NamedCountedRow::new(1, 2, 11, 6), "pair"),
+        (NamedCountedRow::new(3, 4, 10, 6), "computed"),
+    ] {
+        let error = table.insert(row).unwrap_err();
+        assert_eq!(error.kind, InsertErrorKind::Unique { field: index });
+        for key in [
+            &error.row.first,
+            &error.row.second,
+            &error.row.derived,
+            &error.row.group,
+        ] {
+            assert_eq!(key.clones.get(), 0);
+        }
+    }
+    let row = NamedCountedRow::new(1, 2, 11, 6);
+    let first_clones = row.first.clones.clone();
+    let second_clones = row.second.clones.clone();
+    table.replace(id, row).unwrap();
+    assert_eq!(first_clones.get(), 0);
+    assert_eq!(second_clones.get(), 0);
+    assert_eq!(table.get_by_pair(&1, &2).unwrap().0, id);
+    assert!(table.get_by_pair(&3, &4).is_none());
+    assert!(table.get_by_computed(&10).is_none());
+    assert_eq!(table.get_by_computed(&11).unwrap().0, id);
+    assert_eq!(table.iter_by_computed_group(&5).count(), 0);
+    assert_eq!(table.iter_by_computed_group(&6).count(), 1);
+    table.remove(id);
+    assert!(table.get_by_pair(&1, &2).is_none());
+    assert!(table.get_by_computed(&11).is_none());
+    assert_eq!(table.iter_by_computed_group(&6).count(), 0);
+}
+
 #[test]
 fn removal_keeps_ids_stable_and_rejects_stale_generations() {
     let mut table = PersonTable::new();
