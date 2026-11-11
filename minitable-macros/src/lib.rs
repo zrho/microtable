@@ -1,6 +1,8 @@
 //! Attribute expansion for `minitable`.
 #![forbid(unsafe_code)]
 
+use std::collections::HashSet;
+
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
@@ -109,7 +111,8 @@ fn parse_index(attr: &syn::Attribute, fields: &syn::FieldsNamed) -> syn::Result<
     let mut selected_fields = None;
     let mut key_type = None;
     let mut expression = None;
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
+
     attr.parse_nested_meta(|meta| {
         let option = meta
             .path
@@ -151,7 +154,7 @@ fn parse_index(attr: &syn::Attribute, fields: &syn::FieldsNamed) -> syn::Result<
             if selected.is_empty() {
                 return Err(syn::Error::new(attr.span(), "fields must not be empty"));
             }
-            let mut seen = std::collections::HashSet::new();
+            let mut seen = HashSet::new();
             let mut result = Vec::new();
             for field in selected {
                 if !seen.insert(field.unraw().to_string()) {
@@ -220,7 +223,7 @@ fn expand(args: TokenStream2, mut row: ItemStruct) -> syn::Result<TokenStream2> 
     let mut id = format_ident!("{}Id", name.unraw());
     let mut index_type: syn::Ident = syn::parse_quote!(usize);
     let mut generational = true;
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     syn::meta::parser(|meta| {
         let key = meta
             .path
@@ -315,7 +318,7 @@ fn expand(args: TokenStream2, mut row: ItemStruct) -> syn::Result<TokenStream2> 
         }
     }
     row.attrs = retained;
-    let mut index_names = std::collections::HashSet::new();
+    let mut index_names = HashSet::new();
     for index in &indexes {
         if !index_names.insert(index.name.unraw().to_string()) {
             return Err(syn::Error::new(index.name.span(), "duplicate index name"));
@@ -548,11 +551,6 @@ fn expand(args: TokenStream2, mut row: ItemStruct) -> syn::Result<TokenStream2> 
         }
     }
     let generation_field = generational.then(|| quote!(generation: u64,));
-    let arena = if generational {
-        quote!(#runtime::__private::GenerationalArena)
-    } else {
-        quote!(#runtime::__private::NonGenerationalArena)
-    };
     let generation_init = generational.then(|| quote!(generation,));
     let generation_read = if generational {
         quote!(self.generation)
@@ -600,7 +598,7 @@ fn expand(args: TokenStream2, mut row: ItemStruct) -> syn::Result<TokenStream2> 
         #(#cfg)*
         #[doc = "A table with stable row IDs and generated indexes. Mutation is through checked replacement."]
         #vis struct #table #table_generics #table_where {
-            __rows: #arena<#entry #row_args, #id>,
+            __rows: #runtime::__private::Arena<#entry #row_args, #id, #generational>,
             #(#map_fields,)*
         }
 

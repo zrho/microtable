@@ -92,9 +92,7 @@ impl<T: std::fmt::Debug> std::error::Error for ReplaceError<T> {}
 /// Implementation details used by generated code; not a stable public API.
 #[doc(hidden)]
 pub mod __private {
-    pub use crate::arena::{
-        generational::Arena as GenerationalArena, non_generational::Arena as NonGenerationalArena,
-    };
+    pub use crate::arena::Arena;
     pub use indexmap::IndexMap;
     pub use indexmap::map::{RawEntryApiV1, raw_entry_v1::RawEntryMut};
 

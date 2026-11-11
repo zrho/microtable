@@ -35,10 +35,10 @@ fn counters(count: usize) -> Rc<Vec<Cell<usize>>> {
 }
 
 macro_rules! arena_tests {
-    ($implementation:ident) => {
+    ($implementation:ident, $generational:literal) => {
         mod $implementation {
             use super::*;
-            use crate::arena::$implementation::Arena;
+            type Arena<T, Id> = crate::arena::Arena<T, Id, $generational>;
 
             #[test]
             fn reuse_and_sparse_iteration_across_bitmap_words() {
@@ -177,21 +177,31 @@ macro_rules! arena_tests {
     };
 }
 
-arena_tests!(generational);
-arena_tests!(non_generational);
+arena_tests!(generational, true);
+arena_tests!(non_generational, false);
 
 #[test]
-fn non_generational_arena_has_no_generation_vector() {
-    use std::mem::size_of;
-    assert_eq!(
-        size_of::<super::generational::Arena<u8, Id>>(),
-        size_of::<super::non_generational::Arena<u8, Id>>() + size_of::<Vec<u64>>()
-    );
+fn non_generational_arena_keeps_generation_vector_empty() {
+    let mut arena = super::Arena::<_, Id, false>::default();
+    let ids: Vec<_> = (0..256).map(|value| arena.insert(value).unwrap()).collect();
+    assert!(arena.generations.is_empty());
+    assert_eq!(arena.generations.capacity(), 0);
+    for id in ids {
+        assert!(arena.get(id).is_some());
+        assert!(arena.get_mut(id).is_some());
+        assert!(arena.remove(id).is_some());
+    }
+    for value in 0..256 {
+        arena.insert(value).unwrap();
+    }
+    assert_eq!(arena.iter().count(), 256);
+    assert!(arena.generations.is_empty());
+    assert_eq!(arena.generations.capacity(), 0);
 }
 
 #[test]
 fn generations_reject_stale_mutable_access_after_reuse() {
-    let mut arena = super::generational::Arena::<_, Id>::default();
+    let mut arena = super::Arena::<_, Id, true>::default();
     let old = arena.insert(String::from("old")).unwrap();
     assert_eq!(arena.remove(old).unwrap(), "old");
     let new = arena.insert(String::from("new")).unwrap();
@@ -201,4 +211,52 @@ fn generations_reject_stale_mutable_access_after_reuse() {
     assert!(arena.get_mut(old).is_none());
     assert!(arena.remove(old).is_none());
     assert_eq!(arena.get(new).unwrap(), "new");
+}
+
+#[test]
+fn generation_exhaustion_retires_slot() {
+    let mut arena = super::Arena::<_, Id, true>::default();
+    let first = arena.insert(1).unwrap();
+    arena.generations[first.index()] = u64::MAX;
+    let last = Id(first.0, u64::MAX);
+    assert_eq!(arena.remove(last), Some(1));
+    assert_eq!(arena.get(last), None);
+    assert_eq!(arena.remove(last), None);
+    let next = arena.insert(2).unwrap();
+    assert_ne!(next.index(), first.index());
+    assert_eq!(arena.len(), 1);
+    assert_eq!(
+        arena.iter().map(|(_, value)| *value).collect::<Vec<_>>(),
+        [2]
+    );
+}
+
+#[test]
+fn non_generational_arena_never_reads_id_generations() {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct IndexOnly(usize);
+    impl RowId for IndexOnly {
+        fn from_parts(index: usize, generation: u64) -> Option<Self> {
+            assert_eq!(generation, 0);
+            Some(Self(index))
+        }
+        fn index(self) -> usize {
+            self.0
+        }
+        fn generation(self) -> u64 {
+            panic!("non-generational arena read a generation")
+        }
+    }
+    let mut arena = super::Arena::<_, IndexOnly, false>::default();
+    assert!(arena.can_insert());
+    let old = arena.insert(1).unwrap();
+    assert_eq!(arena.get(old), Some(&1));
+    *arena.get_mut(old).unwrap() = 2;
+    assert_eq!(arena.remove(old), Some(2));
+    let new = arena.insert(3).unwrap();
+    assert_eq!(new, old);
+    assert_eq!(arena.iter().collect::<Vec<_>>(), [(new, &3)]);
+    assert_eq!(arena.remove(new), Some(3));
+    assert!(arena.generations.is_empty());
+    assert_eq!(arena.generations.capacity(), 0);
 }

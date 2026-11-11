@@ -157,13 +157,13 @@ row. Full-table iteration scans allocated slots, including holes. Iteration orde
 is unspecified.
 
 Rows occupy reusable slots maintained by a free list. Removing one row never
-shifts another row's ID. The macro selects separate generational or
-non-generational arena implementations at compile time. Occupancy is stored in
+shifts another row's ID. A single arena uses a compile-time boolean to select
+generational or non-generational behavior. Occupancy is stored in
 a `bitvec` bitmap, using one bit per allocated slot. A slot is a union of the row
 and a one-word free-list link, so vacant slots do not reserve additional link
-space alongside a row. Only the generational arena stores a separate `u64`
-generation vector; the non-generational arena has no generation metadata or
-generation checks. Unsafe union access is confined to the shared slot-storage
+space alongside a row. The arena contains a separate `u64` generation vector;
+in non-generational mode it stays empty with zero capacity, and generation
+checks are skipped. Unsafe union access is confined to the shared slot-storage
 module, which owns occupancy tracking and drops each live row exactly once,
 including cleanup after a row destructor panics.
 
