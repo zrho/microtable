@@ -89,9 +89,25 @@ Generated tables provide:
 | `get_by_<field>(&key)` | `Option<(Id, &Row)>` for a unique index |
 | `iter_by_<field>(&key)` | Iterator of `(Id, &Row)` for a many index |
 
-Indexed fields require `Clone + Eq + Hash`. Non-indexed fields have no additional
-bounds. Lookups support borrowed keys through `Borrow`, such as a `str` lookup
-against a `String` field. Row access is immutable; change rows through `replace`.
+Noncached indexed fields require `Eq + Hash`; cached indexed fields also require
+`Clone`. Non-indexed fields have no additional bounds. Lookups support borrowed
+keys through `Borrow`, such as a `str` lookup against a `String` field. Row access
+is immutable; change rows through `replace` in mutable tables.
+
+## Append-only tables
+
+Use `#[minitable::table(append_only)]` or `append_only = true` when rows must
+not be removed or replaced. These tables retain `insert`, read methods, full
+and indexed iteration, `new`, `default`, `len`, and `is_empty`; `remove` and
+`replace` are not generated. Index cache options and defaults, custom IDs, and
+`index_type` work as in mutable tables.
+
+Append-only rows use a dense `Vec`, with no vacant slots or free list. Each many
+index stores one plain ID successor per row in a circular group, with a stable
+representative row ID. There are no per-row cached hashes. Group iteration
+visits each matching row once; all iteration order is unspecified.
+
+## Named indexes
 
 Declare named indexes on the struct to combine fields or compute keys:
 
@@ -121,20 +137,24 @@ assert_eq!(accounts.get_by_normalized_email("1:ada@example.com").unwrap().0, id)
 
 Named indexes support both `unique` and `many`, and coexist with field attributes.
 Names must be distinct from every other index name, including field indexes.
-`fields(...)` accepts one or more distinct field names; several fields are stored
-as a tuple key. Composite lookups take one borrowed argument per field, in the
-declared order, with no heap allocation or component clones. Each component
-requires `Clone + Eq + Hash`.
+`fields(...)` accepts one or more distinct field names. Composite lookups take
+one borrowed argument per field, in the declared order.
+
+Field and composite indexes default to noncached storage; computed indexes
+default to cached storage. Both `#[indexed(unique, ...)]` /
+`#[indexed(many, ...)]` and `#[index(...)]` accept `cached` (equivalent to
+`cached = true`) or `cached = false`.
 
 Computed indexes require an explicit `key_type` and a `key` function path or
-non-capturing closure, coerced to `fn(&Row) -> Key`. Only the resulting key type
-needs `Clone + Eq + Hash`; source fields need no additional bounds. Computations
-should be deterministic functions of the row. Each result is evaluated once per
-attempted write that reaches index validation and cached in the private wrapper.
-Removal and lookup do not rerun computations. Keys may borrow data with an
-existing row lifetime, but cannot borrow from the row's owned fields. A computed
-tuple key is queried using a reference to that tuple; separate borrowed arguments
-are generated for `fields(...)` declarations.
+non-capturing closure, coerced to `fn(&Row) -> Key`. The result needs only
+`Eq + Hash`, not `Clone`, even when cached: the key is moved into the map. Source
+fields need no additional bounds. Cached keys are computed once per attempted
+write that reaches validation and stored in the index map, not the row wrapper.
+Lookup, removal, and rehash do not rerun cached computations. Noncached computed
+keys are recomputed from stored rows for equality checks, lookups, and rehashing;
+these functions must be deterministic and must not panic. Keys may borrow data
+with an existing row lifetime, but cannot borrow from the row's owned fields.
+A computed tuple key is queried using a reference to that tuple.
 
 Insertion errors expose the rejected `row` and a `kind`:
 `InsertErrorKind::Unique { field }` or `InsertErrorKind::CapacityExhausted`.
@@ -146,34 +166,31 @@ Every returned error leaves the table unchanged. Replacements can keep their
 own unique values. Error types implement `Debug` when the row does, so using
 `unwrap()` on a write result requires a `Debug` row.
 
-Indexes use `indexmap::IndexMap` with `std::hash::RandomState`. Unique constraints
-are checked through borrowed raw entries, retaining the computed hash for
-insertion. Keys are cloned only after all checks pass; replacements also skip
-cloning unchanged unique keys. Generated code does not clone index keys on
-rejected writes; user-provided computed-key functions may themselves allocate
-or clone while producing their result.
-Index entries use `swap_remove` for expected constant-time deletion; their
-positions are independent of the arena-based row IDs. Iteration order remains
-unspecified.
+Indexes use `hashbrown` with a shared `std::hash::RandomState` hasher. Noncached
+indexes use `HashTable<Id>` and derive keys from rows. Cached indexes use
+`HashMap` and own their keys. Each cached key includes its representative row ID
+as metadata that does not affect hashing or equality. Each entry holds one row
+ID for a unique index or a representative ID for a many index. In mutable
+tables, per-row cached hashes support detaching cached index entries. Rows are
+detached from indexes before replacement or removal.
 
-Each many index stores a hash map from a distinct field value to a list head.
-The doubly linked list's previous/next IDs live in a private wrapper around each
-row, with independent links for each many index. There is no vector or set of IDs
-allocated for each value. Insert, remove, replace, and unique lookup take expected
-constant time per index, excluding field hashing/cloning costs. A many lookup
-takes expected constant time to find the head, then constant time per matching
-row. Full-table iteration scans allocated slots, including holes. Iteration order
-is unspecified.
+In mutable tables, each many index uses a doubly linked list with previous/next
+IDs in a private row wrapper, with independent links for each many index. There is no vector or
+set of IDs allocated for each value. Insert, remove, replace, and unique lookup
+take expected constant time per index, excluding key computation, hashing,
+equality, and cloning costs. A many lookup takes expected constant time to find
+the head, then constant time per matching row. Full-table iteration scans
+allocated slots, including holes. Iteration order is unspecified.
 
-Rows occupy reusable slots maintained by a free list. Removing one row never
-shifts another row's ID. Occupancy is stored in a `bitvec` bitmap, using one bit
+Mutable rows occupy reusable slots maintained by a free list. Removing one row
+never shifts another row's ID. Occupancy is stored in a `bitvec` bitmap, using one bit
 per allocated slot. A slot is a union of the row and a one-word free-list link,
 so vacant slots do not reserve additional link space alongside a row. Unsafe
 union access is confined to the slot-storage module, which owns occupancy
 tracking and drops each live row exactly once, including cleanup after a row
 destructor panics.
 
-An old ID can refer to a replacement row after slot reuse.
+In mutable tables, an old ID can refer to a replacement row after slot reuse.
 
 IDs are local to a table instance: they carry no table-instance identifier and
 must not be used to address a different instance. Index keys must retain stable

@@ -9,7 +9,7 @@ pub struct Person {
     number: u32,
     #[indexed(many)]
     team: String,
-    #[indexed(many)]
+    #[indexed(many, cached)]
     active: bool,
     payload: Vec<u8>,
 }
@@ -99,31 +99,38 @@ impl std::hash::Hash for CountedKey {
     }
 }
 
-#[table(index_type = u8)]
-#[derive(Debug)]
-struct CountedRow {
-    #[indexed(unique)]
-    first: CountedKey,
-    #[indexed(unique)]
-    second: CountedKey,
-    #[indexed(many)]
-    group: u8,
+macro_rules! counted_row {
+    ($name:ident $(, $option:meta)*) => {
+        #[table(index_type = u8 $(, $option)*)]
+        #[derive(Debug)]
+        struct $name {
+            #[indexed(unique)]
+            first: CountedKey,
+            #[indexed(unique, cached)]
+            second: CountedKey,
+            #[indexed(many)]
+            group: u8,
+        }
+
+        impl $name {
+            fn new(first: u32, second: u32, group: u8) -> Self {
+                Self {
+                    first: CountedKey::new(first),
+                    second: CountedKey::new(second),
+                    group,
+                }
+            }
+        }
+    };
 }
 
-impl CountedRow {
-    fn new(first: u32, second: u32, group: u8) -> Self {
-        Self {
-            first: CountedKey::new(first),
-            second: CountedKey::new(second),
-            group,
-        }
-    }
-}
+counted_row!(CountedRow);
+counted_row!(AppendCountedRow, append_only);
 
 #[test]
 fn unique_entries_hash_each_new_key_once() {
     let mut table = CountedRowTable::new();
-    // Use nonempty maps so a separate validation lookup would hash the key.
+    // Use nonempty indexes, with room for this insert without a rehash.
     table
         .insert(CountedRow {
             first: CountedKey::new(0),
@@ -143,8 +150,21 @@ fn unique_entries_hash_each_new_key_once() {
     let id = table.insert(row).unwrap();
     assert_eq!(first_hashes.get(), 1);
     assert_eq!(second_hashes.get(), 1);
-    assert_eq!(first_clones.get(), 1);
-    assert_eq!(second_clones.get(), 1);
+    assert_eq!(first_clones.get(), 0); // Default field keys stay in the row.
+    assert_eq!(second_clones.get(), 1); // Cached fields own one key.
+
+    let mut append = AppendCountedRowTable::new();
+    append.insert(AppendCountedRow::new(0, 0, 0)).unwrap();
+    let row = AppendCountedRow::new(1, 1, 0);
+    let counters = [&row.first, &row.second].map(|key| (key.hashes.clone(), key.clones.clone()));
+    let append_id = append.insert(row).unwrap();
+    for (index, (hashes, clones)) in counters.into_iter().enumerate() {
+        assert_eq!(hashes.get(), 1);
+        assert_eq!(clones.get(), index);
+    }
+    assert_eq!(append.get_by_first(&1).unwrap().0, append_id);
+    assert_eq!(append.get_by_second(&1).unwrap().0, append_id);
+    assert_eq!(append.iter_by_group(&0).take(3).count(), 2);
 
     // Change one unique key and retain the other, with independent hash counters.
     let row = CountedRow {
@@ -159,11 +179,11 @@ fn unique_entries_hash_each_new_key_once() {
     let old = table.replace(id, row).unwrap();
     assert_eq!(new_first_hashes.get(), 1);
     assert_eq!(new_second_hashes.get(), 1);
-    assert_eq!(new_first_clones.get(), 1);
+    assert_eq!(new_first_clones.get(), 0);
     assert_eq!(new_second_clones.get(), 0);
-    // Only the changed old key needs a removal lookup.
-    assert_eq!(first_hashes.get(), 2);
-    assert_eq!(second_hashes.get(), 1);
+    // Row-backed stored keys may be hashed again during detach or rehash.
+    assert_eq!(first_clones.get(), 0);
+    assert_eq!(second_clones.get(), 1);
     assert_eq!(old.first.value, 1);
     assert_eq!(table.get(id).unwrap().first.value, 2);
     assert_eq!(table.iter_by_group(&1).count(), 0);
@@ -193,6 +213,22 @@ fn conflicting_writes_do_not_clone_keys() {
         assert!(table.get_by_second(&2).is_none());
         assert_eq!(table.iter_by_group(&1).count(), 0);
     }
+    let mut append = AppendCountedRowTable::new();
+    let id = append.insert(AppendCountedRow::new(0, 0, 0)).unwrap();
+    for (first, second, field) in [(0, 2, "first"), (2, 0, "second")] {
+        let error = append
+            .insert(AppendCountedRow::new(first, second, 1))
+            .unwrap_err();
+        assert_eq!(error.kind, InsertErrorKind::Unique { field });
+        assert_eq!(error.row.first.clones.get(), 0);
+        assert_eq!(error.row.second.clones.get(), 0);
+        assert_eq!(append.len(), 1);
+        assert_eq!(append.get_by_first(&0).unwrap().0, id);
+        assert_eq!(append.get_by_second(&0).unwrap().0, id);
+        assert!(append.get_by_first(&2).is_none());
+        assert!(append.get_by_second(&2).is_none());
+        assert!(append.iter_by_group(&1).next().is_none());
+    }
     table.remove(b);
     let error = table.replace(b, CountedRow::new(2, 2, 1)).unwrap_err();
     assert_eq!(error.kind, ReplaceErrorKind::NotFound);
@@ -206,22 +242,58 @@ fn exhausted_capacity_does_not_clone_keys() {
     for value in 0..256 {
         table.insert(CountedRow::new(value, value, 0)).unwrap();
     }
-    let error = table.insert(CountedRow::new(256, 256, 1)).unwrap_err();
-    assert_eq!(error.kind, InsertErrorKind::CapacityExhausted);
-    assert_eq!(error.row.first.clones.get(), 0);
-    assert_eq!(error.row.second.clones.get(), 0);
+    let mutable_error = table.insert(CountedRow::new(256, 256, 1)).unwrap_err();
+    assert_eq!(mutable_error.kind, InsertErrorKind::CapacityExhausted);
+    assert_eq!(mutable_error.row.first.clones.get(), 0);
+    assert_eq!(mutable_error.row.second.clones.get(), 0);
     assert!(table.get_by_first(&256).is_none());
     assert!(table.get_by_second(&256).is_none());
     assert_eq!(table.iter_by_group(&1).count(), 0);
+    // Append-only capacity errors also leave cached and row-backed indexes intact.
+    let mut append = AppendCountedRowTable::default();
+    assert!(append.is_empty());
+    for value in 0..256 {
+        let id: u8 = append
+            .insert(AppendCountedRow::new(value, value, (value % 3) as u8))
+            .unwrap();
+        assert_eq!(id as u32, value);
+        assert_eq!(append.get_by_first(&value).unwrap().0, id);
+        assert_eq!(append.get_by_second(&value).unwrap().0, id);
+    }
+    let error = append
+        .insert(AppendCountedRow::new(256, 256, 3))
+        .unwrap_err();
+    assert_eq!(error.kind, InsertErrorKind::CapacityExhausted);
+    assert_eq!(error.row.first.clones.get(), 0);
+    assert_eq!(error.row.second.clones.get(), 0);
+    assert_eq!(append.len(), 256);
+    assert_eq!(append.iter().count(), 256);
+    assert!(append.get_by_first(&256).is_none());
+    assert!(append.get_by_second(&256).is_none());
+    assert!(append.iter_by_group(&3).next().is_none());
+    for group in 0..3 {
+        let mut actual: Vec<_> = append
+            .iter_by_group(&group)
+            .take(257)
+            .map(|(_, row)| row.first.value)
+            .collect();
+        actual.sort_unstable();
+        assert_eq!(
+            actual,
+            (0..256)
+                .filter(|value| value % 3 == group as u32)
+                .collect::<Vec<_>>()
+        );
+    }
     let first = table.get_by_first(&0).unwrap().0;
     table.remove(first);
-    let reused = table.insert(error.row).unwrap();
+    let reused = table.insert(mutable_error.row).unwrap();
     assert_eq!(reused, first);
     assert_eq!(table.get_by_first(&256).unwrap().0, reused);
 }
 
 #[table]
-#[index(name = pair, unique, fields(first, second))]
+#[index(name = pair, unique, cached, fields(first, second))]
 #[index(name = computed, unique, key_type = CountedKey, key = |row| counted_output(&row.derived))]
 #[index(name = computed_group, many, key_type = CountedKey, key = |row| counted_output(&row.group))]
 #[derive(Debug)]
@@ -259,9 +331,10 @@ fn named_indexes_preserve_hash_and_clone_optimizations() {
     let counters = [&row.first, &row.second, &row.derived, &row.group]
         .map(|key| (key.hashes.clone(), key.clones.clone()));
     let id = table.insert(row).unwrap();
-    for (hashes, clones) in counters {
+    for (index, (hashes, clones)) in counters.into_iter().enumerate() {
         assert_eq!(hashes.get(), 1);
-        assert_eq!(clones.get(), 1);
+        // Cached composite fields clone once; computed outputs move into the cache.
+        assert_eq!(clones.get(), usize::from(index < 2));
     }
     // A composite conflict and a later computed-key conflict both defer all cloning.
     for (row, index) in [
@@ -282,9 +355,13 @@ fn named_indexes_preserve_hash_and_clone_optimizations() {
     let row = NamedCountedRow::new(1, 2, 11, 6);
     let first_clones = row.first.clones.clone();
     let second_clones = row.second.clones.clone();
+    let derived_clones = row.derived.clones.clone();
+    let group_clones = row.group.clones.clone();
     table.replace(id, row).unwrap();
     assert_eq!(first_clones.get(), 0);
     assert_eq!(second_clones.get(), 0);
+    assert_eq!(derived_clones.get(), 0);
+    assert_eq!(group_clones.get(), 0);
     assert_eq!(table.get_by_pair(&1, &2).unwrap().0, id);
     assert!(table.get_by_pair(&3, &4).is_none());
     assert!(table.get_by_computed(&10).is_none());
@@ -384,18 +461,26 @@ impl TinyId {
     }
 }
 
-#[table(
-    table = TinyTable,
-    id = TinyId,
-    index_type = u8,
-    id_from_index = TinyId::new,
-    id_to_index = |id| id.index(),
-)]
-#[derive(Debug)]
-struct Tiny {
-    #[indexed(many)]
-    group: u8,
+macro_rules! tiny_row {
+    ($name:ident, $table:ident $(, $option:meta)*) => {
+        #[table(
+            table = $table,
+            id = TinyId,
+            index_type = u8,
+            id_from_index = TinyId::new,
+            id_to_index = |id| id.index(),
+            $($option,)*
+        )]
+        #[derive(Debug)]
+        struct $name {
+            #[indexed(many)]
+            group: u8,
+        }
+    };
 }
+
+tiny_row!(Tiny, TinyTable);
+tiny_row!(AppendTiny, AppendTinyTable, append_only = true);
 
 #[test]
 fn narrow_id_capacity_and_free_list() {
@@ -416,6 +501,29 @@ fn narrow_id_capacity_and_free_list() {
     assert_eq!(b.index(), 5);
     assert_eq!(table.iter_by_group(&0).count(), 3);
     assert_eq!(table.iter().count(), 256);
+
+    let mut append = AppendTinyTable::new();
+    for value in 0..=u8::MAX {
+        let id: TinyId = append.insert(AppendTiny { group: value % 2 }).unwrap();
+        assert_eq!(id.index(), value);
+        assert!(append.contains(id));
+    }
+    assert_eq!(append.len(), 256);
+    assert_eq!(append.iter().count(), 256);
+    for group in 0..2 {
+        let mut iter = append.iter_by_group(&group);
+        for _ in 0..128 {
+            assert_eq!(iter.next().unwrap().1.group, group);
+        }
+        assert!(iter.next().is_none());
+        assert!(iter.next().is_none());
+    }
+    assert!(append.iter_by_group(&2).next().is_none());
+    let error = append.insert(AppendTiny { group: 2 }).unwrap_err();
+    assert_eq!(error.kind, InsertErrorKind::CapacityExhausted);
+    assert_eq!(error.row.group, 2);
+    assert_eq!(append.len(), 256);
+    assert!(append.iter_by_group(&2).next().is_none());
 }
 
 #[table(index_type = u16)]
@@ -433,35 +541,78 @@ fn integer_id_reuses_slots() {
     assert_eq!(table.get(first).unwrap().value, 2);
 }
 
-#[table]
-struct Generic<'a, T, const N: usize>
-where
-    T: PartialEq,
-{
-    #[indexed(unique)]
-    key: T,
-    #[indexed(many)]
-    label: &'a str,
-    data: [u8; N],
+macro_rules! generic_row {
+    ($row:ident $(, $option:meta)*) => {
+        #[table($($option),*)]
+        struct $row<'a, T, const N: usize>
+        where
+            T: PartialEq,
+        {
+            #[indexed(unique)]
+            key: T,
+            #[indexed(many)]
+            label: &'a str,
+            data: [u8; N],
+        }
+    };
 }
+
+generic_row!(Generic);
+generic_row!(AppendGeneric, append_only = true);
 
 #[test]
 fn generic_rows_lifetimes_and_non_indexed_data() {
-    let label = String::from("borrowed");
-    let mut table = GenericTable::<String, 3>::new();
-    let id = table
-        .insert(Generic {
-            key: "key".into(),
-            label: &label,
-            data: [1, 2, 3],
-        })
-        .ok()
-        .unwrap();
-    assert_eq!(table.get_by_key("key").unwrap().0, id);
-    assert_eq!(
-        table.iter_by_label(&label[..]).next().unwrap().1.data,
-        [1, 2, 3]
-    );
+    #[derive(PartialEq, Eq, Hash)]
+    struct Key(u32); // Default field indexes do not need Clone.
+
+    macro_rules! check {
+        ($row:ident, $table:ident) => {{
+            let label = String::from("borrowed");
+            let mut table = $table::<Key, 3>::new();
+            let id = table
+                .insert($row {
+                    key: Key(7),
+                    label: &label,
+                    data: [1, 2, 3],
+                })
+                .ok()
+                .unwrap();
+            assert_eq!(table.get_by_key(&Key(7)).unwrap().0, id);
+            assert_eq!(
+                table.iter_by_label(&label[..]).next().unwrap().1.data,
+                [1, 2, 3]
+            );
+            let mut singleton = table.iter_by_label("borrowed");
+            assert_eq!(singleton.next().unwrap().0, id);
+            assert!(singleton.next().is_none());
+            assert!(singleton.next().is_none());
+            drop(singleton);
+            for value in 8..12 {
+                table
+                    .insert($row {
+                        key: Key(value),
+                        label: &label,
+                        data: [4, 5, 6],
+                    })
+                    .ok()
+                    .unwrap();
+            }
+            let matches = {
+                let query = String::from("borrowed");
+                table.iter_by_label(query.as_str())
+            };
+            let mut ids: Vec<_> = matches.take(6).map(|(id, _)| id).collect();
+            ids.sort_unstable();
+            assert_eq!(ids, [0, 1, 2, 3, 4]);
+            let mut absent = table.iter_by_label("absent");
+            assert!(absent.next().is_none());
+            assert!(absent.next().is_none());
+            assert_eq!(table.len(), 5);
+            assert_eq!(table.iter().count(), 5);
+        }};
+    }
+    check!(Generic, GenericTable);
+    check!(AppendGeneric, AppendGenericTable);
 }
 
 #[test]
@@ -486,12 +637,31 @@ struct Disabled {
 #[cfg_attr(all(), derive(Debug))]
 struct Empty {}
 
+#[table(append_only)]
+#[derive(Debug)]
+struct AppendEmpty {}
+
 #[test]
 fn empty_rows_work() {
     let mut table = EmptyTable::new();
     let id = table.insert(Empty {}).unwrap();
     assert_eq!(table.iter().count(), 1);
     assert!(table.remove(id).is_some());
+
+    let mut append = AppendEmptyTable::default();
+    assert!(append.is_empty());
+    assert_eq!(append.len(), 0);
+    assert!(append.iter().next().is_none());
+    assert!(append.get(0).is_none());
+    let first = append.insert(AppendEmpty {}).unwrap();
+    let second = append.insert(AppendEmpty {}).unwrap();
+    assert_ne!(first, second);
+    assert!(append.contains(first));
+    assert!(append.get(second).is_some());
+    assert_eq!(append.len(), 2);
+    let mut ids: Vec<_> = append.iter().map(|(id, _)| id).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, [first, second]);
 }
 
 #[table(index_type = i8)]

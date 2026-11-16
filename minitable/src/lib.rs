@@ -22,8 +22,7 @@
 //! ```
 //! #[minitable::table]
 //! #[index(name = tenant_name, unique, fields(tenant, name))]
-//! #[index(name = normalized, many, key_type = String,
-//!         key = |row| row.name.to_ascii_lowercase())]
+//! #[index(name = normalized, many, key_type = String, key = |row| row.name.to_ascii_lowercase())]
 //! #[derive(Debug)]
 //! struct User { tenant: u32, name: String }
 //! let mut users = UserTable::new();
@@ -31,6 +30,51 @@
 //! assert_eq!(users.get_by_tenant_name(&1, "Ada").unwrap().0, id);
 //! assert_eq!(users.iter_by_normalized("ada").next().unwrap().0, id);
 //! ```
+//!
+//! # Append-only tables
+//!
+//! `#[minitable::table(append_only)]` generates an append-only table. It supports
+//! insertion and immutable access, but does not generate `remove` or `replace`.
+//! `append_only = false` is the default. Cache options and ID conversions work
+//! in both modes.
+//!
+//! Append-only rows use dense vector storage, without a free list or occupancy
+//! bitmap. Each many index uses one successor ID per row in a circular singly
+//! linked list. Cached indexes do not need per-row hashes in this mode. IDs stay
+//! valid for the lifetime of the table, but vector growth can move row values.
+//! Iteration order is unspecified.
+//!
+//! # Index storage and key requirements
+//!
+//! Field and composite indexes default to noncached storage. Computed indexes
+//! default to cached storage. Both `#[indexed(unique)]` / `#[indexed(many)]` and
+//! `#[index(...)]` accept `cached`, `cached = true`, or `cached = false`. For
+//! example, `#[indexed(unique, cached)]` caches a field key, while
+//! `#[index(name = pair, many, fields(tenant, name), cached = false)]` derives
+//! its key from stored rows.
+//!
+//! Noncached field and composite components require `Eq + Hash`, not `Clone`.
+//! Cached components require `Clone + Eq + Hash`. A computed index declares
+//! `key_type` and a `key` function path or non-capturing closure of type
+//! `fn(&Row) -> Key`. Its result requires only `Eq + Hash`, even when cached:
+//! the result is moved into the map. Source fields need no additional bounds.
+//!
+//! Cached computed keys are evaluated once per attempted write that reaches
+//! validation. They are stored in the index map, not the row wrapper. Lookup,
+//! removal, and rehash do not rerun these computations. Noncached computed keys
+//! are recomputed from stored rows for equality checks, lookups, and rehashing.
+//! These functions must be deterministic and must not panic. Computed keys can
+//! borrow data with an existing row lifetime, but cannot borrow from the row's
+//! owned fields. All stored keys must retain stable hash and equality behavior.
+//!
+//! Indexes use `hashbrown` with a shared `std::hash::RandomState` hasher.
+//! Noncached indexes use `HashTable<Id>` and derive keys from rows. Cached
+//! indexes use `HashMap` and own the key. Cached keys include a representative
+//! row ID as metadata that does not affect hashing or equality. Each entry holds
+//! one row ID for a unique index or a group-head ID for a many index.
+//! Many-index links live in a private row wrapper. Mutable tables store per-row
+//! cached hashes for detachment and detach rows before replacement or removal.
+//! Iteration order is unspecified.
 #![deny(unsafe_code)]
 
 mod arena;
@@ -92,9 +136,28 @@ impl<T: std::fmt::Debug> std::error::Error for ReplaceError<T> {}
 /// Implementation details used by generated code; not a stable public API.
 #[doc(hidden)]
 pub mod __private {
-    pub use crate::arena::Arena;
-    pub use indexmap::IndexMap;
-    pub use indexmap::map::{RawEntryApiV1, raw_entry_v1::RawEntryMut};
+    pub use crate::arena::{AppendArena, Arena};
+    pub use hashbrown::hash_map::RawEntryMut;
+    pub use hashbrown::{HashMap, HashTable};
+
+    // The representative ID is metadata, not part of key equality or hashing.
+    // Keeping it beside the key permits removal by ID without computing the key.
+    pub struct CachedKey<K, Id> {
+        pub key: K,
+        pub id: Id,
+    }
+
+    impl<K: std::hash::Hash, Id> std::hash::Hash for CachedKey<K, Id> {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            self.key.hash(state);
+        }
+    }
+    impl<K: PartialEq, Id> PartialEq for CachedKey<K, Id> {
+        fn eq(&self, other: &Self) -> bool {
+            self.key == other.key
+        }
+    }
+    impl<K: Eq, Id> Eq for CachedKey<K, Id> {}
 
     pub struct Links<Id> {
         pub prev: Option<Id>,

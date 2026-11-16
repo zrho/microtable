@@ -1,4 +1,8 @@
-//! Stable union-backed slots with caller-provided ID conversions.
+//! Stable row storage with caller-provided ID conversions.
+
+pub use append::AppendArena;
+
+mod append;
 
 use slots::Slots;
 

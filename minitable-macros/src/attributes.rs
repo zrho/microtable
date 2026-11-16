@@ -7,6 +7,8 @@ use syn::{parse::Parse, punctuated::Punctuated, spanned::Spanned};
 
 #[derive(Default, FromMeta)]
 pub(super) struct TableOptions {
+    #[darling(default)]
+    pub append_only: bool,
     pub table: Option<syn::Ident>,
     pub id: Option<syn::Type>,
     pub index_type: Option<syn::Ident>,
@@ -18,6 +20,7 @@ pub(super) struct TableOptions {
 pub(super) struct IndexMode {
     pub unique: Flag,
     pub many: Flag,
+    pub cached: Option<bool>,
 }
 
 impl IndexMode {
