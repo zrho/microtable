@@ -62,7 +62,7 @@ impl<T> Slots<T> {
     }
 
     pub fn insert(&mut self, value: T) -> usize {
-        assert!(self.can_insert(), "arena structural capacity exhausted");
+        assert!(self.can_insert(), "table capacity exhausted");
         let index = self.next_index();
         if self.free.is_some() {
             // SAFETY: The free-list head is vacant and has initialized next_free.

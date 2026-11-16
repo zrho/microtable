@@ -79,7 +79,7 @@ Generated tables provide:
 | --- | --- |
 | `new()`, `default()` | Empty table |
 | `len()`, `is_empty()` | Live row count |
-| `insert(row)` | `Result<Id, InsertError<Row>>` |
+| `insert(row)` | `Result<Id, (Row, Id)>`, returning the rejected row and blocking ID on a unique conflict |
 | `get(id)` | `Option<&Row>` |
 | `contains(id)` | Whether the ID currently exists |
 | `replace(id, row)` | `Result<Row, ReplaceError<Row>>`, returning the old row |
@@ -204,17 +204,24 @@ these functions must be deterministic and must not panic. Keys may borrow data
 with an existing row lifetime, but cannot borrow from the row's owned fields.
 A computed tuple key is queried using a reference to that tuple.
 
-Insertion errors expose the rejected `row` and a `kind`:
-`InsertErrorKind::Unique { field }` or `InsertErrorKind::CapacityExhausted`.
-`CapacityExhausted` means real storage or slot-index-space exhaustion, not a
-narrow-ID limit. It does not recover from out-of-memory allocation failures.
-Replacement errors similarly expose the rejected row, with
+Insertion returns `Err((rejected_row, blocking_id))` for the first unique index
+conflict in validation order. The rejected row is returned to the caller, not
+dropped automatically. The blocking ID identifies the existing row. Unique
+conflicts leave the table and all indexes unchanged.
+Field indexes are validated in field order, then named indexes in declaration
+order. Enum indexes are validated in declaration order within the active variant.
+
+Structural capacity checks panic with `table capacity exhausted` after uniqueness
+checks and before table mutation. This means real storage or slot-index-space
+exhaustion, not a narrow-ID limit. Allocation failures can panic or abort; they
+are not returned as errors.
+
+Replacement errors expose the rejected `row` and a `kind`:
 `ReplaceErrorKind::Unique { field }` or `ReplaceErrorKind::NotFound`.
-For a named index, `field` contains the index name. Field indexes are validated
-in field order, then named indexes in declaration order.
-Every returned error leaves the table unchanged. Replacements can keep their
-own unique values. Error types implement `Debug` when the row does, so using
-`unwrap()` on a write result requires a `Debug` row.
+For a named index, `field` contains the index name. Every returned replacement
+error leaves the table unchanged. Replacements can keep their own unique values.
+Using `unwrap()` on an insert result requires both `Row: Debug` and `Id: Debug`.
+Using `unwrap()` on a replacement result requires `Row: Debug`.
 
 Indexes use `hashbrown` with a shared `std::hash::RandomState` hasher. Noncached
 indexes use `HashTable<Id>` and derive keys from rows. Cached indexes use

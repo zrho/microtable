@@ -1,4 +1,4 @@
-use microtable::{InsertErrorKind, ReplaceErrorKind, table};
+use microtable::{ReplaceErrorKind, table};
 
 #[table]
 #[derive(Debug, PartialEq, Eq)]
@@ -43,8 +43,9 @@ fn insert_unique_checks_and_borrowed_lookup() {
     let mut rejected = person(1, "blue");
     rejected.email = "other@example.com".into();
     let error = table.insert(rejected).unwrap_err();
-    assert_eq!(error.kind, InsertErrorKind::Unique { field: "number" });
-    assert_eq!(error.row.email, "other@example.com");
+    assert_eq!(error.1, id);
+    assert_eq!(error.0.email, "other@example.com");
+    assert_eq!(error.0.team, "blue");
     assert!(table.get_by_email("other@example.com").is_none());
     assert_eq!(members(&table, "red"), [1]);
     assert!(members(&table, "blue").is_empty());
@@ -196,10 +197,20 @@ fn conflicting_writes_do_not_clone_keys() {
     let a = table.insert(CountedRow::new(0, 0, 0)).unwrap();
     let b = table.insert(CountedRow::new(1, 1, 0)).unwrap();
     for (first, second, field) in [(0, 2, "first"), (2, 0, "second")] {
-        let error = table.insert(CountedRow::new(first, second, 1)).unwrap_err();
-        assert_eq!(error.kind, InsertErrorKind::Unique { field });
-        assert_eq!(error.row.first.clones.get(), 0);
-        assert_eq!(error.row.second.clones.get(), 0);
+        let row = CountedRow::new(first, second, 1);
+        let clones = [&row.first, &row.second].map(|key| key.clones.clone());
+        let error = table.insert(row).unwrap_err();
+        assert_eq!(error.1, a);
+        assert_eq!(error.0.first.value, first);
+        assert_eq!(error.0.second.value, second);
+        for clones in &clones {
+            assert_eq!(clones.get(), 0);
+            assert_eq!(std::rc::Rc::strong_count(clones), 2); // Rejected row is still owned.
+        }
+        drop(error);
+        for clones in &clones {
+            assert_eq!(std::rc::Rc::strong_count(clones), 1);
+        }
         let error = table
             .replace(b, CountedRow::new(first, second, 1))
             .unwrap_err();
@@ -215,13 +226,21 @@ fn conflicting_writes_do_not_clone_keys() {
     }
     let mut append = AppendCountedRowTable::new();
     let id = append.insert(AppendCountedRow::new(0, 0, 0)).unwrap();
-    for (first, second, field) in [(0, 2, "first"), (2, 0, "second")] {
-        let error = append
-            .insert(AppendCountedRow::new(first, second, 1))
-            .unwrap_err();
-        assert_eq!(error.kind, InsertErrorKind::Unique { field });
-        assert_eq!(error.row.first.clones.get(), 0);
-        assert_eq!(error.row.second.clones.get(), 0);
+    for (first, second) in [(0, 2), (2, 0)] {
+        let row = AppendCountedRow::new(first, second, 1);
+        let clones = [&row.first, &row.second].map(|key| key.clones.clone());
+        let error = append.insert(row).unwrap_err();
+        assert_eq!(error.1, id);
+        assert_eq!(error.0.first.value, first);
+        assert_eq!(error.0.second.value, second);
+        for clones in &clones {
+            assert_eq!(clones.get(), 0);
+            assert_eq!(std::rc::Rc::strong_count(clones), 2);
+        }
+        drop(error);
+        for clones in &clones {
+            assert_eq!(std::rc::Rc::strong_count(clones), 1);
+        }
         assert_eq!(append.len(), 1);
         assert_eq!(append.get_by_first(&0).unwrap().0, id);
         assert_eq!(append.get_by_second(&0).unwrap().0, id);
@@ -350,20 +369,30 @@ fn named_indexes_preserve_hash_and_clone_optimizations() {
         assert_eq!(clones.get(), usize::from(index < 2));
     }
     // A composite conflict and a later computed-key conflict both defer all cloning.
-    for (row, index) in [
-        (NamedCountedRow::new(1, 2, 11, 6), "pair"),
-        (NamedCountedRow::new(3, 4, 10, 6), "computed"),
+    for row in [
+        NamedCountedRow::new(1, 2, 11, 6),
+        NamedCountedRow::new(3, 4, 10, 6),
     ] {
+        let clones =
+            [&row.first, &row.second, &row.derived, &row.group].map(|key| key.clones.clone());
         let error = table.insert(row).unwrap_err();
-        assert_eq!(error.kind, InsertErrorKind::Unique { field: index });
-        for key in [
-            &error.row.first,
-            &error.row.second,
-            &error.row.derived,
-            &error.row.group,
-        ] {
-            assert_eq!(key.clones.get(), 0);
+        assert_eq!(error.1, id);
+        assert_eq!(error.0.group.value, 6);
+        for clones in &clones {
+            assert_eq!(clones.get(), 0);
+            assert_eq!(std::rc::Rc::strong_count(clones), 2);
         }
+        drop(error);
+        for clones in &clones {
+            assert_eq!(std::rc::Rc::strong_count(clones), 1);
+        }
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.get_by_pair(&1, &2).unwrap().0, id);
+        assert_eq!(table.get_by_computed(&10).unwrap().0, id);
+        assert!(table.get_by_pair(&3, &4).is_none());
+        assert!(table.get_by_computed(&11).is_none());
+        assert_eq!(table.iter_by_computed_group(&5).count(), 1);
+        assert_eq!(table.iter_by_computed_group(&6).count(), 0);
     }
     let row = NamedCountedRow::new(1, 2, 11, 6);
     let first_clones = row.first.clones.clone();
@@ -536,13 +565,10 @@ fn custom_id_growth_and_free_list() {
             assert_eq!(table.len(), 320);
             assert_eq!(table.iter().count(), 320);
             let error = table.insert($row::Second(128)).unwrap_err();
-            assert_eq!(
-                error.kind,
-                InsertErrorKind::Unique {
-                    field: "second_by_key"
-                }
-            );
-            assert_eq!(error.row, $row::Second(128));
+            assert_eq!(error.0, $row::Second(128));
+            assert_eq!(error.1, TinyId::new(257));
+            assert_eq!(table.get_second_by_key(&128).unwrap().0, error.1);
+            assert_eq!(table.len(), 320);
             for group in 0..2 {
                 for rows in [
                     table
@@ -850,7 +876,7 @@ fn growth_and_raw_field_names() {
 #[test]
 fn randomized_operations_match_a_scan_model() {
     let mut table = PersonTable::new();
-    let mut model = std::collections::HashMap::new();
+    let mut model = std::collections::HashMap::<usize, Person>::new();
     let mut history = Vec::new();
     let mut seed = 42u64;
     for _ in 0..3000 {
@@ -861,14 +887,19 @@ fn randomized_operations_match_a_scan_model() {
         let chosen = (!history.is_empty()).then(|| history[(seed >> 16) as usize % history.len()]);
         match (seed % 3, chosen) {
             (0, _) | (_, None) => {
-                let conflict = model.values().any(|old: &Person| old.number == number);
+                let conflict = model
+                    .iter()
+                    .find_map(|(&id, old)| (old.number == number).then_some(id));
                 match table.insert(row) {
                     Ok(id) => {
-                        assert!(!conflict);
+                        assert!(conflict.is_none());
                         model.insert(id, person(number, team));
                         history.push(id);
                     }
-                    Err(_) => assert!(conflict),
+                    Err((rejected, id)) => {
+                        assert_eq!(rejected, person(number, team));
+                        assert_eq!(Some(id), conflict);
+                    }
                 }
             }
             (1, Some(id)) => {

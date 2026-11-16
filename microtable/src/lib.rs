@@ -56,6 +56,20 @@
 //! is an enum that stores index links and cached hashes only for the active
 //! variant, not for every variant.
 //!
+//! # Insertion and replacement failures
+//!
+//! `insert(row)` returns `Result<Id, (Row, Id)>`: `Ok` contains the new ID, and
+//! `Err` contains the rejected row followed by the existing row ID that conflicts
+//! with the first unique index checked. The table stays unchanged. Unique indexes
+//! are checked in declaration order, with field indexes first for structs. Enum
+//! constraints apply only within the incoming variant. Calling `unwrap()` on an
+//! insertion result requires `Debug` for both the row and the ID.
+//!
+//! After unique validation, insertion panics with `table capacity exhausted`
+//! if row storage cannot grow or reuse a slot. The capacity check runs before
+//! key cloning or table mutation. Allocation failures are not returned as errors.
+//! Replacement returns a `ReplaceError` with the rejected row and reason.
+//!
 //! # Row IDs and storage indices
 //!
 //! Row IDs default to `usize`. A custom `id = Type` requires both
@@ -116,35 +130,6 @@
 mod arena;
 
 pub use microtable_macros::table;
-
-/// Why an insertion failed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum InsertErrorKind {
-    Unique {
-        field: &'static str,
-    },
-    /// The storage cannot represent another row. Does not report allocation failures.
-    CapacityExhausted,
-}
-
-/// An insertion failure, including ownership of the rejected row.
-#[derive(Debug, PartialEq, Eq)]
-pub struct InsertError<T> {
-    pub kind: InsertErrorKind,
-    pub row: T,
-}
-
-impl<T> std::fmt::Display for InsertError<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.kind {
-            InsertErrorKind::Unique { field } => {
-                write!(f, "unique index `{field}` already contains this value")
-            }
-            InsertErrorKind::CapacityExhausted => f.write_str("table capacity exhausted"),
-        }
-    }
-}
-impl<T: std::fmt::Debug> std::error::Error for InsertError<T> {}
 
 /// Why a replacement failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

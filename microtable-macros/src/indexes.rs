@@ -230,8 +230,8 @@ impl Code {
         match index.kind {
             Kind::Unique => {
                 self.checks_insert.push(quote! {
-                    if (#find_new).is_some() {
-                        return ::std::result::Result::Err(#runtime::InsertError { row, kind: #runtime::InsertErrorKind::Unique { field: ::std::stringify!(#field) } });
+                    if let ::std::option::Option::Some(existing) = #find_new {
+                        return ::std::result::Result::Err((row, existing));
                     }
                 });
                 let reinsert = context.variant.is_some();

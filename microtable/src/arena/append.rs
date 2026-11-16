@@ -39,6 +39,7 @@ impl<T, Id: Copy> AppendArena<T, Id> {
     // Generated code checks can_insert, calls next_id once, then reserves before
     // building the row's cyclic links. Push must not convert the ID again.
     pub fn push(&mut self, value: T) {
+        assert!(self.can_insert(), "table capacity exhausted");
         self.values.push(value);
     }
 

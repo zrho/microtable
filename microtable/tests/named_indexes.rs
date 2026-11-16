@@ -1,4 +1,4 @@
-use microtable::{InsertErrorKind, ReplaceErrorKind, table};
+use microtable::{ReplaceErrorKind, table};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct NamedId(usize);
@@ -169,14 +169,22 @@ fn named_indexes_coexist_and_support_borrowed_queries() {
                 ids.sort_unstable();
                 assert_eq!(ids, [b, d]);
             }
-            for row in [
-                $row::Person(item_payload(3, "same", "rejected")),
-                $row::Person(item_payload(1, "unused", "rejected")),
-                $row::Device(item_payload(3, "same", "rejected")),
-                $row::Device(item_payload(1, "unused", "rejected")),
+            for (row, expected) in [
+                ($row::Person(item_payload(3, "same", "rejected")), a),
+                ($row::Person(item_payload(1, "unused", "rejected")), a),
+                ($row::Device(item_payload(3, "same", "rejected")), b),
+                ($row::Device(item_payload(1, "unused", "rejected")), b),
+                ($row::Person(item_payload(2, "same", "rejected")), a),
+                ($row::Device(item_payload(2, "same", "rejected")), b),
             ] {
                 let error = table.insert(row).unwrap_err();
-                assert!(matches!(error.kind, InsertErrorKind::Unique { .. }));
+                assert_eq!(error.1, expected);
+                match &error.0 {
+                    $row::Person(payload) | $row::Device(payload) => {
+                        assert_eq!(payload.kind, "rejected");
+                    }
+                    _ => panic!("wrong variant"),
+                }
                 assert_eq!(table.len(), 5);
                 assert!(table.get_person_by_email("unused").is_none());
                 assert!(table.get_device_by_email("unused").is_none());
@@ -219,10 +227,12 @@ fn named_indexes_coexist_and_support_borrowed_queries() {
             assert_eq!(table.get_by_normalized("1:ada").unwrap().0, a);
             assert_eq!($group(&table, 1, "red"), [1, 3]);
             assert_eq!($group(&table, 2, "red"), [2]);
-            for (handle, index) in [("Ada", "tenant_handle"), ("aDA", "normalized")] {
-                let error = table.insert($member(4, 1, handle, "blue")).unwrap_err();
-                assert_eq!(error.kind, InsertErrorKind::Unique { field: index });
-                assert_eq!(error.row.handle, handle);
+            for (serial, handle, expected) in [(4, "Ada", a), (4, "aDA", a), (2, "Ada", b)] {
+                let error = table
+                    .insert($member(serial, 1, handle, "blue"))
+                    .unwrap_err();
+                assert_eq!(error.1, expected);
+                assert_eq!(error.0, $member(serial, 1, handle, "blue"));
                 assert_eq!(table.len(), 3);
                 assert!(table.get_by_serial(&4).is_none());
                 assert!($group(&table, 1, "blue").is_empty());
@@ -269,8 +279,8 @@ fn named_constraints_leave_all_indexes_unchanged_on_error() {
     for (handle, index) in [("Ada", "tenant_handle"), ("aDA", "normalized")] {
         let row = member(3, 1, handle, "blue");
         let error = table.insert(row).unwrap_err();
-        assert_eq!(error.kind, InsertErrorKind::Unique { field: index });
-        assert_eq!(error.row.handle, handle);
+        assert_eq!(error.1, a);
+        assert_eq!(error.0, member(3, 1, handle, "blue"));
         let error = table.replace(b, member(3, 1, handle, "blue")).unwrap_err();
         assert_eq!(error.kind, ReplaceErrorKind::Unique { field: index });
         assert!(table.get_by_serial(&3).is_none());
@@ -663,12 +673,9 @@ fn computed_keys_are_cached_for_removal_and_old_replacement_keys() {
             calls: calls.clone(),
         })
         .unwrap_err();
-    assert_eq!(
-        error.kind,
-        InsertErrorKind::Unique {
-            field: "calculated"
-        }
-    );
+    assert_eq!(error.1, id);
+    assert_eq!(error.0.value, 2);
+    assert!(std::rc::Rc::ptr_eq(&error.0.calls, &calls));
     assert_eq!(calls.get(), 6);
     table
         .replace(
@@ -740,12 +747,9 @@ fn computed_keys_are_cached_for_removal_and_old_replacement_keys() {
             calls: calls.clone(),
         })
         .unwrap_err();
-    assert_eq!(
-        error.kind,
-        InsertErrorKind::Unique {
-            field: "calculated"
-        }
-    );
+    assert_eq!(error.1, append.get_by_calculated(&0).unwrap().0);
+    assert_eq!(error.0.value, 0);
+    assert!(std::rc::Rc::ptr_eq(&error.0.calls, &calls));
     assert_eq!(calls.get(), 130);
     assert_eq!(append.len(), 64);
     assert!(append.iter_by_bucket(&64).next().is_none());
@@ -774,14 +778,30 @@ fn randomized_named_index_operations_match_a_scan_model() {
         };
         match (seed % 3, chosen) {
             (0, _) | (_, None) => {
-                let conflict = conflicting(None);
+                let conflict = model
+                    .iter()
+                    .find_map(|(&id, old)| (old.serial == serial).then_some(id))
+                    .or_else(|| {
+                        model.iter().find_map(|(&id, old)| {
+                            (old.tenant == tenant && old.handle == handle).then_some(id)
+                        })
+                    })
+                    .or_else(|| {
+                        model.iter().find_map(|(&id, old)| {
+                            (old.tenant == tenant && old.handle.eq_ignore_ascii_case(handle))
+                                .then_some(id)
+                        })
+                    });
                 match table.insert(member(serial, tenant, handle, category)) {
                     Ok(id) => {
-                        assert!(!conflict);
+                        assert!(conflict.is_none());
                         model.insert(id, member(serial, tenant, handle, category));
                         history.push(id);
                     }
-                    Err(_) => assert!(conflict),
+                    Err((rejected, id)) => {
+                        assert_eq!(rejected, member(serial, tenant, handle, category));
+                        assert_eq!(Some(id), conflict);
+                    }
                 }
             }
             (1, Some(id)) => {

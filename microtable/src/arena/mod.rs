@@ -43,13 +43,11 @@ impl<T, Id: Copy> Arena<T, Id> {
         self.slots.can_insert()
     }
 
-    pub fn insert(&mut self, value: T) -> Result<Id, T> {
-        if !self.can_insert() {
-            return Err(value);
-        }
+    pub fn insert(&mut self, value: T) -> Id {
+        assert!(self.can_insert(), "table capacity exhausted");
         let id = self.next_id();
         self.slots.insert(value);
-        Ok(id)
+        id
     }
 
     pub fn get(&self, id: Id) -> Option<&T> {

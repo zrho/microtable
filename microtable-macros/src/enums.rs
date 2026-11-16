@@ -172,30 +172,16 @@ pub(super) fn expand(args: TokenStream2, mut row: syn::ItemEnum) -> syn::Result<
     } else {
         quote!(#runtime::__private::Arena)
     };
-    let capacity_check = if append_only {
-        quote! {
-            if !self.__rows.can_insert() {
-                return ::std::result::Result::Err(#runtime::InsertError { row, kind: #runtime::InsertErrorKind::CapacityExhausted });
-            }
-            let id = self.__rows.next_id();
-        }
-    } else {
-        quote! {
-            if !self.__rows.can_insert() {
-                return ::std::result::Result::Err(#runtime::InsertError { row, kind: #runtime::InsertErrorKind::CapacityExhausted });
-            }
-        }
+    let next_id = append_only.then(|| quote!(let id = self.__rows.next_id();));
+    let capacity_check = quote! {
+        ::std::assert!(self.__rows.can_insert(), "table capacity exhausted");
+        #next_id
     };
     let reserve_rows = append_only.then(|| quote!(self.__rows.reserve(1);));
     let insert_row = if append_only {
         quote!(self.__rows.push(entry);)
     } else {
-        quote! {
-            let id = match self.__rows.insert(entry) {
-                ::std::result::Result::Ok(id) => id,
-                ::std::result::Result::Err(entry) => return ::std::result::Result::Err(#runtime::InsertError { row: entry.row, kind: #runtime::InsertErrorKind::CapacityExhausted }),
-            };
-        }
+        quote!(let id = self.__rows.insert(entry);)
     };
     let mut metadata_structs = Vec::new();
     let mut metadata_variants = Vec::new();
@@ -394,7 +380,10 @@ pub(super) fn expand(args: TokenStream2, mut row: syn::ItemEnum) -> syn::Result<
             #vis fn iter(&self) -> impl ::std::iter::Iterator<Item = (#id, &#name #row_args)> + '_ {
                 self.__rows.iter().map(|(id, entry)| (id, &entry.row))
             }
-            #vis fn insert(&mut self, row: #name #row_args) -> ::std::result::Result<#id, #runtime::InsertError<#name #row_args>> {
+            /// Insert a row, returning its ID or the rejected row and first conflicting ID.
+            /// Unique conflicts leave the table unchanged.
+            /// Panics if row storage capacity is exhausted.
+            #vis fn insert(&mut self, row: #name #row_args) -> ::std::result::Result<#id, (#name #row_args, #id)> {
                 match &row { #(#insert_arms,)* }
             }
             #mutations
