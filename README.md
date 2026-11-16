@@ -1,6 +1,6 @@
 # minitable
 
-A Rust library that generates tables with stable, typed row IDs and hash-based
+A Rust library that generates tables with stable row IDs and hash-based
 field indexes. The workspace contains `minitable` (runtime storage and errors)
 and `minitable-macros` (the attribute macro, re-exported by `minitable`).
 
@@ -16,7 +16,7 @@ pub struct Person {
 }
 
 let mut people = PersonTable::new();
-let id: PersonId = people.insert(Person {
+let id: u32 = people.insert(Person {
     email: "ada@example.com".into(),
     team: "engineering".into(),
     name: "Ada".into(),
@@ -43,24 +43,33 @@ assert!(people.get(id).is_none());
 ```
 
 The macro preserves the original struct and its ordinary attributes. It generates
-`PersonTable` and `PersonId` with the struct's visibility. Rows can have lifetimes,
+`PersonTable` with the struct's visibility. Rows can have lifetimes,
 type parameters, const parameters, and where clauses.
 
-Configure the generated types with:
+Configure the table and use a custom ID type with:
 
 ```rust
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PersonKey(u16);
+
 #[minitable::table(
     table = People,
     id = PersonKey,
     index_type = u16,
-    generational = false,
+    id_from_index = |index| PersonKey(index),
+    id_to_index = |id| id.0,
 )]
 struct Person {
     name: String,
 }
 ```
 
-Defaults are `<Struct>Table`, `<Struct>Id`, `usize`, and `generational = true`.
+The table name defaults to `<Struct>Table`, and `index_type` defaults to `usize`.
+Row IDs use `index_type` directly unless a custom `id` type is specified.
+A custom ID requires both `id_from_index: fn(Index) -> Id` and
+`id_to_index: fn(Id) -> Index`. Each callback accepts a function path, such as
+`PersonKey::new`, or a non-capturing closure. The ID type must implement
+`Copy + Eq`. The callbacks must be deterministic inverses and must not panic.
 `index_type` accepts primitive signed or unsigned integer types. Only nonnegative
 slot indices are used, and storage is also limited by the platform's `usize`.
 For example, `u8` supports 256 allocated slots, while `i8` supports 128.
@@ -157,22 +166,14 @@ row. Full-table iteration scans allocated slots, including holes. Iteration orde
 is unspecified.
 
 Rows occupy reusable slots maintained by a free list. Removing one row never
-shifts another row's ID. A single arena uses a compile-time boolean to select
-generational or non-generational behavior. Occupancy is stored in
-a `bitvec` bitmap, using one bit per allocated slot. A slot is a union of the row
-and a one-word free-list link, so vacant slots do not reserve additional link
-space alongside a row. The arena contains a separate `u64` generation vector;
-in non-generational mode it stays empty with zero capacity, and generation
-checks are skipped. Unsafe union access is confined to the shared slot-storage
-module, which owns occupancy tracking and drops each live row exactly once,
-including cleanup after a row destructor panics.
+shifts another row's ID. Occupancy is stored in a `bitvec` bitmap, using one bit
+per allocated slot. A slot is a union of the row and a one-word free-list link,
+so vacant slots do not reserve additional link space alongside a row. Unsafe
+union access is confined to the slot-storage module, which owns occupancy
+tracking and drops each live row exactly once, including cleanup after a row
+destructor panics.
 
-Generational IDs contain the configured slot integer
-and a separate `u64` generation; a removed ID cannot access its replacement. A
-slot is permanently retired if its generation counter is exhausted. Without
-generations, an ID contains only the configured integer, and an old ID can refer
-to a replacement row after slot reuse. `id.index()` exposes the backing integer;
-generational IDs also provide `id.generation()`.
+An old ID can refer to a replacement row after slot reuse.
 
 IDs are local to a table instance: they carry no table-instance identifier and
 must not be used to address a different instance. Index keys must retain stable

@@ -96,12 +96,6 @@ pub mod __private {
     pub use indexmap::IndexMap;
     pub use indexmap::map::{RawEntryApiV1, raw_entry_v1::RawEntryMut};
 
-    pub trait RowId: Copy + Eq {
-        fn from_parts(index: usize, generation: u64) -> Option<Self>;
-        fn index(self) -> usize;
-        fn generation(self) -> u64;
-    }
-
     pub struct Links<Id> {
         pub prev: Option<Id>,
         pub next: Option<Id>,

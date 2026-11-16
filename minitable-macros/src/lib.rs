@@ -6,12 +6,16 @@ use std::collections::HashSet;
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
-use syn::{Fields, ItemStruct, ext::IdentExt, parse::Parser, parse_macro_input, spanned::Spanned};
+use syn::{Fields, ItemStruct, ext::IdentExt, parse_macro_input, spanned::Spanned};
 
-/// Generate a table and a typed row ID from a named-field struct.
+mod attributes;
+use attributes::{IndexMode, IndexOptions, TableOptions};
+
+/// Generate a table from a named-field struct.
 ///
-/// Options: `table = Name`, `id = Name`, `index_type = u32`, and
-/// `generational = false`. Field attributes: `#[indexed(unique)]` or `#[indexed(many)]`.
+/// Options: `table = Name`, `index_type = u32`, and optional `id = Type` with
+/// `id_from_index = function_or_closure` and `id_to_index = function_or_closure`.
+/// Field attributes: `#[indexed(unique)]` or `#[indexed(many)]`.
 /// Named struct attributes: `#[index(name = pair, unique, fields(a, b))]` or
 /// `#[index(name = derived, many, key_type = String, key = compute_key)]`.
 #[proc_macro_attribute]
@@ -106,51 +110,11 @@ impl Index {
 }
 
 fn parse_index(attr: &syn::Attribute, fields: &syn::FieldsNamed) -> syn::Result<Index> {
-    let mut name = None;
-    let mut kind = None;
-    let mut selected_fields = None;
-    let mut key_type = None;
-    let mut expression = None;
-    let mut seen = HashSet::new();
-
-    attr.parse_nested_meta(|meta| {
-        let option = meta
-            .path
-            .get_ident()
-            .ok_or_else(|| meta.error("expected an index option"))?
-            .to_string();
-        if !seen.insert(option.clone()) {
-            return Err(meta.error("duplicate index option"));
-        }
-        match option.as_str() {
-            "name" => name = Some(meta.value()?.parse::<syn::Ident>()?),
-            "unique" | "many" => {
-                if kind.is_some() {
-                    return Err(meta.error("choose either unique or many"));
-                }
-                kind = Some(if option == "unique" {
-                    Kind::Unique
-                } else {
-                    Kind::Many
-                });
-            }
-            "fields" => {
-                let content;
-                syn::parenthesized!(content in meta.input);
-                selected_fields =
-                    Some(content.parse_terminated(syn::Ident::parse_any, syn::Token![,])?);
-            }
-            "key_type" => key_type = Some(meta.value()?.parse::<syn::Type>()?),
-            "key" => expression = Some(meta.value()?.parse::<syn::Expr>()?),
-            _ => return Err(meta.error("expected name, unique, many, fields, key_type, or key")),
-        }
-        Ok(())
-    })?;
-    let name =
-        name.ok_or_else(|| syn::Error::new(attr.span(), "index requires name = identifier"))?;
-    let kind = kind.ok_or_else(|| syn::Error::new(attr.span(), "index requires unique or many"))?;
-    let key = match (selected_fields, key_type, expression) {
-        (Some(selected), None, None) => {
+    let options: IndexOptions = attributes::parse_attribute(attr)?;
+    let name = options.name;
+    let kind = options.mode.kind(attr.span())?;
+    let key = match (options.fields, options.key_type, options.key) {
+        (Some(attributes::FieldList(selected)), None, None) => {
             if selected.is_empty() {
                 return Err(syn::Error::new(attr.span(), "fields must not be empty"));
             }
@@ -219,30 +183,13 @@ fn conditional_meta(meta: &syn::Meta) -> syn::Result<Option<syn::Meta>> {
 fn expand(args: TokenStream2, mut row: ItemStruct) -> syn::Result<TokenStream2> {
     let name = row.ident.clone();
     let vis = &row.vis;
-    let mut table = format_ident!("{}Table", name.unraw());
-    let mut id = format_ident!("{}Id", name.unraw());
-    let mut index_type: syn::Ident = syn::parse_quote!(usize);
-    let mut generational = true;
-    let mut seen = HashSet::new();
-    syn::meta::parser(|meta| {
-        let key = meta
-            .path
-            .get_ident()
-            .ok_or_else(|| meta.error("expected an option name"))?
-            .to_string();
-        if !seen.insert(key.clone()) {
-            return Err(meta.error("duplicate table option"));
-        }
-        match key.as_str() {
-            "table" => table = meta.value()?.parse()?,
-            "id" => id = meta.value()?.parse()?,
-            "index_type" => index_type = meta.value()?.parse()?,
-            "generational" => generational = meta.value()?.parse::<syn::LitBool>()?.value,
-            _ => return Err(meta.error("expected table, id, index_type, or generational")),
-        }
-        Ok(())
-    })
-    .parse2(args)?;
+    let options: TableOptions = attributes::parse(args)?;
+    let table = options
+        .table
+        .unwrap_or_else(|| format_ident!("{}Table", name.unraw()));
+    let index_type = options
+        .index_type
+        .unwrap_or_else(|| syn::parse_quote!(usize));
     if !matches!(
         index_type.to_string().as_str(),
         "u8" | "u16"
@@ -262,12 +209,27 @@ fn expand(args: TokenStream2, mut row: ItemStruct) -> syn::Result<TokenStream2> 
             "index_type must be a primitive integer type",
         ));
     }
-    if table == name || id == name || table == id {
+    if table == name {
         return Err(syn::Error::new(
             name.span(),
-            "row, table, and ID names must be distinct",
+            "row and table names must be distinct",
         ));
     }
+    let (id, id_from_index, id_to_index) =
+        match (options.id, options.id_from_index, options.id_to_index) {
+            (None, None, None) => (
+                syn::parse_quote!(#index_type),
+                quote!(|index| index),
+                quote!(|id| id),
+            ),
+            (Some(id), Some(from), Some(to)) => (id, quote!(#from), quote!(#to)),
+            _ => {
+                return Err(syn::Error::new(
+                    name.span(),
+                    "specify id, id_from_index, and id_to_index together",
+                ));
+            }
+        };
     let Fields::Named(fields) = &mut row.fields else {
         return Err(syn::Error::new(
             row.span(),
@@ -283,12 +245,8 @@ fn expand(args: TokenStream2, mut row: ItemStruct) -> syn::Result<TokenStream2> 
                 if kind.is_some() {
                     return Err(syn::Error::new(attr.span(), "duplicate indexed attribute"));
                 }
-                let mode: syn::Ident = attr.parse_args()?;
-                kind = Some(match mode.to_string().as_str() {
-                    "unique" => Kind::Unique,
-                    "many" => Kind::Many,
-                    _ => return Err(syn::Error::new(mode.span(), "expected unique or many")),
-                });
+                let mode: IndexMode = attributes::parse_attribute(&attr)?;
+                kind = Some(mode.kind(attr.span())?);
             } else {
                 if attr.path().is_ident("cfg") || attr.path().is_ident("cfg_attr") {
                     return Err(syn::Error::new(
@@ -342,6 +300,12 @@ fn expand(args: TokenStream2, mut row: ItemStruct) -> syn::Result<TokenStream2> 
     let original_generics = &row.generics;
     let (_, row_args, row_where) = original_generics.split_for_impl();
     let mut table_generics = row.generics.clone();
+    table_generics
+        .make_where_clause()
+        .predicates
+        .push(syn::parse_quote!(
+            #id: ::std::marker::Copy + ::std::cmp::Eq
+        ));
     for index in &indexes {
         for ty in index.types() {
             table_generics
@@ -550,43 +514,8 @@ fn expand(args: TokenStream2, mut row: ItemStruct) -> syn::Result<TokenStream2> 
             }
         }
     }
-    let generation_field = generational.then(|| quote!(generation: u64,));
-    let generation_init = generational.then(|| quote!(generation,));
-    let generation_read = if generational {
-        quote!(self.generation)
-    } else {
-        quote!(0)
-    };
-    let generation_method = generational.then(|| {
-        quote! {
-            /// The generation of this slot. Changes whenever a slot is reused.
-            #vis fn generation(self) -> u64 { self.generation }
-        }
-    });
     Ok(quote! {
         #row
-
-        #(#cfg)*
-        #[doc = "Typed row ID. IDs are local to a table instance; they do not identify that instance."]
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-        #vis struct #id { index: #index_type, #generation_field }
-
-        #(#cfg)*
-        impl #id {
-            /// The backing slot index.
-            #vis fn index(self) -> #index_type { self.index }
-            #generation_method
-        }
-
-        #(#cfg)*
-        impl #runtime::__private::RowId for #id {
-            fn from_parts(index: usize, generation: u64) -> ::std::option::Option<Self> {
-                let _ = generation;
-                ::std::option::Option::Some(Self { index: <#index_type as ::std::convert::TryFrom<usize>>::try_from(index).ok()?, #generation_init })
-            }
-            fn index(self) -> usize { self.index as usize }
-            fn generation(self) -> u64 { #generation_read }
-        }
 
         #(#cfg)*
         struct #entry #original_generics #row_where {
@@ -598,14 +527,27 @@ fn expand(args: TokenStream2, mut row: ItemStruct) -> syn::Result<TokenStream2> 
         #(#cfg)*
         #[doc = "A table with stable row IDs and generated indexes. Mutation is through checked replacement."]
         #vis struct #table #table_generics #table_where {
-            __rows: #runtime::__private::Arena<#entry #row_args, #id, #generational>,
+            __rows: #runtime::__private::Arena<#entry #row_args, #id>,
             #(#map_fields,)*
         }
 
         #(#cfg)*
         impl #impl_generics ::std::default::Default for #table #type_generics #table_where {
             fn default() -> Self {
-                Self { __rows: ::std::default::Default::default(), #(#map_defaults,)* }
+                Self {
+                    __rows: #runtime::__private::Arena::new(
+                        |index| {
+                            let index = <#index_type as ::std::convert::TryFrom<usize>>::try_from(index).ok()?;
+                            let convert: fn(#index_type) -> #id = #id_from_index;
+                            ::std::option::Option::Some(convert(index))
+                        },
+                        |id| {
+                            let convert: fn(#id) -> #index_type = #id_to_index;
+                            <usize as ::std::convert::TryFrom<#index_type>>::try_from(convert(id)).ok()
+                        },
+                    ),
+                    #(#map_defaults,)*
+                }
             }
         }
 
@@ -617,7 +559,7 @@ fn expand(args: TokenStream2, mut row: ItemStruct) -> syn::Result<TokenStream2> 
             #vis fn len(&self) -> usize { self.__rows.len() }
             /// Whether the table contains no rows.
             #vis fn is_empty(&self) -> bool { self.len() == 0 }
-            /// Get a row by ID. Stale generational IDs return `None`.
+            /// Get a row by ID. Removed IDs can refer to rows inserted into reused slots.
             #vis fn get(&self, id: #id) -> ::std::option::Option<&#name #row_args> {
                 self.__rows.get(id).map(|entry| &entry.row)
             }
@@ -697,7 +639,7 @@ mod tests {
                         key: u32,
                     }
                 ),
-                "unique or many",
+                "Unknown field: `wrong`",
             ),
             (
                 quote!(),
@@ -718,18 +660,18 @@ mod tests {
                 "primitive integer",
             ),
             (
-                quote!(generational = true, generational = false),
+                quote!(index_type = u8, index_type = u16),
                 quote!(
                     struct Row {}
                 ),
-                "duplicate table option",
+                "Duplicate field `index_type`",
             ),
             (
                 quote!(unknown = true),
                 quote!(
                     struct Row {}
                 ),
-                "expected table",
+                "Unknown field: `unknown`",
             ),
             (
                 quote!(),
@@ -739,7 +681,7 @@ mod tests {
                         a: u32,
                     }
                 ),
-                "requires name",
+                "Missing field `name`",
             ),
             (
                 quote!(),
@@ -826,7 +768,7 @@ mod tests {
                         a: u32,
                     }
                 ),
-                "duplicate index option",
+                "Duplicate field `name`",
             ),
             (
                 quote!(),
@@ -836,7 +778,7 @@ mod tests {
                         a: u32,
                     }
                 ),
-                "expected name",
+                "Unknown field: `unknown`",
             ),
         ] {
             let error = expand(args, syn::parse2(item).unwrap()).unwrap_err();

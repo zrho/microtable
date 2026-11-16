@@ -216,7 +216,7 @@ fn exhausted_capacity_does_not_clone_keys() {
     let first = table.get_by_first(&0).unwrap().0;
     table.remove(first);
     let reused = table.insert(error.row).unwrap();
-    assert_eq!(reused.index(), first.index());
+    assert_eq!(reused, first);
     assert_eq!(table.get_by_first(&256).unwrap().0, reused);
 }
 
@@ -298,18 +298,18 @@ fn named_indexes_preserve_hash_and_clone_optimizations() {
 }
 
 #[test]
-fn removal_keeps_ids_stable_and_rejects_stale_generations() {
+fn removal_keeps_ids_stable_and_reuses_slots() {
     let mut table = PersonTable::new();
     let a = table.insert(person(1, "red")).unwrap();
     let b = table.insert(person(2, "red")).unwrap();
     assert_eq!(table.remove(a), Some(person(1, "red")));
-    let c = table.insert(person(3, "red")).unwrap();
-    assert_eq!(a.index(), c.index());
-    assert_ne!(a.generation(), c.generation());
     assert!(!table.contains(a));
     assert_eq!(table.remove(a), None);
     let error = table.replace(a, person(4, "blue")).unwrap_err();
     assert_eq!(error.kind, ReplaceErrorKind::NotFound);
+    let c = table.insert(person(3, "red")).unwrap();
+    assert_eq!(a, c);
+    assert_eq!(table.get(a).unwrap().number, 3);
     assert_eq!(table.get(b).unwrap().number, 2);
     assert_eq!(table.get(c).unwrap().number, 3);
     assert_eq!(table.len(), 2);
@@ -371,7 +371,26 @@ fn replacement_updates_all_indexes_and_preserves_id() {
     assert!(members(&table, "blue").is_empty());
 }
 
-#[table(table = TinyTable, id = TinyId, index_type = u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TinyId(u8);
+
+impl TinyId {
+    fn new(index: u8) -> Self {
+        Self(index)
+    }
+
+    fn index(self) -> u8 {
+        self.0
+    }
+}
+
+#[table(
+    table = TinyTable,
+    id = TinyId,
+    index_type = u8,
+    id_from_index = TinyId::new,
+    id_to_index = |id| id.index(),
+)]
 #[derive(Debug)]
 struct Tiny {
     #[indexed(many)]
@@ -399,16 +418,15 @@ fn narrow_id_capacity_and_free_list() {
     assert_eq!(table.iter().count(), 256);
 }
 
-#[table(index_type = u16, generational = false)]
+#[table(index_type = u16)]
 struct Plain {
     value: u32,
 }
 
 #[test]
-fn non_generational_id_has_only_backing_integer_and_reuses_slots() {
-    assert_eq!(std::mem::size_of::<PlainId>(), std::mem::size_of::<u16>());
+fn integer_id_reuses_slots() {
     let mut table = PlainTable::new();
-    let first = table.insert(Plain { value: 1 }).ok().unwrap();
+    let first: u16 = table.insert(Plain { value: 1 }).ok().unwrap();
     table.remove(first);
     let next = table.insert(Plain { value: 2 }).ok().unwrap();
     assert_eq!(first, next);
@@ -488,7 +506,7 @@ fn signed_backing_and_raw_field_names() {
     let mut table = SignedTable::new();
     for key in 0..128 {
         let id = table.insert(Signed { r#type: key }).unwrap();
-        assert_eq!(id.index(), key as i8);
+        assert_eq!(id, key as i8);
         assert_eq!(table.get_by_type(&key).unwrap().0, id);
     }
     assert_eq!(
@@ -499,7 +517,7 @@ fn signed_backing_and_raw_field_names() {
     let first = table.get_by_type(&0).unwrap().0;
     table.remove(first);
     let reused = table.insert(Signed { r#type: 128 }).unwrap();
-    assert_eq!(reused.index(), first.index());
+    assert_eq!(reused, first);
     assert_eq!(table.get_by_type(&128).unwrap().0, reused);
 }
 

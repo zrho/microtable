@@ -191,7 +191,7 @@ fn computed_keys_are_cached_for_removal_and_old_replacement_keys() {
 #[test]
 fn randomized_named_index_operations_match_a_scan_model() {
     let mut table = MemberTable::new();
-    let mut model = std::collections::HashMap::<MemberId, Member>::new();
+    let mut model = std::collections::HashMap::<usize, Member>::new();
     let mut history = Vec::new();
     let mut seed = 19u64;
     for _ in 0..1500 {

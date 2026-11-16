@@ -3,8 +3,7 @@
 //! - A set bit means `value` is initialized and exclusively owned by this storage.
 //! - Outside destruction, a clear bit means `next_free` is initialized,
 //!   with no live `T` in that slot.
-//! - Free-list links point only to vacant, reusable slots, with no cycles.
-//!   Retired slots are vacant but excluded from the free list.
+//! - Free-list links point only to vacant slots, with no cycles.
 //!
 //! No caller can access the union or mutate the occupancy bits directly.
 
@@ -84,7 +83,7 @@ impl<T> Slots<T> {
         Some(unsafe { &mut self.slots[index].value })
     }
 
-    pub fn remove(&mut self, index: usize, reusable: bool) -> Option<T> {
+    pub fn remove(&mut self, index: usize) -> Option<T> {
         if !self.occupied.get(index).is_some_and(|bit| *bit) {
             return None;
         }
@@ -96,9 +95,7 @@ impl<T> Slots<T> {
         // and immediately initialize next_free. No user code runs in between.
         let value = unsafe { ManuallyDrop::take(&mut self.slots[index].value) };
         self.slots[index].next_free = self.free;
-        if reusable {
-            self.free = link;
-        }
+        self.free = link;
         self.len -= 1;
         Some(value)
     }
