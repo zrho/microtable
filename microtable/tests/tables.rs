@@ -101,7 +101,7 @@ impl std::hash::Hash for CountedKey {
 
 macro_rules! counted_row {
     ($name:ident $(, $option:meta)*) => {
-        #[table(index_type = u8 $(, $option)*)]
+        #[table($($option),*)]
         #[derive(Debug)]
         struct $name {
             #[indexed(unique)]
@@ -237,40 +237,48 @@ fn conflicting_writes_do_not_clone_keys() {
 }
 
 #[test]
-fn exhausted_capacity_does_not_clone_keys() {
+fn growth_preserves_key_ownership() {
     let mut table = CountedRowTable::new();
     for value in 0..256 {
         table.insert(CountedRow::new(value, value, 0)).unwrap();
     }
-    let mutable_error = table.insert(CountedRow::new(256, 256, 1)).unwrap_err();
-    assert_eq!(mutable_error.kind, InsertErrorKind::CapacityExhausted);
-    assert_eq!(mutable_error.row.first.clones.get(), 0);
-    assert_eq!(mutable_error.row.second.clones.get(), 0);
-    assert!(table.get_by_first(&256).is_none());
-    assert!(table.get_by_second(&256).is_none());
-    assert_eq!(table.iter_by_group(&1).count(), 0);
-    // Append-only capacity errors also leave cached and row-backed indexes intact.
+    let row = CountedRow::new(256, 256, 1);
+    let first_clones = row.first.clones.clone();
+    let second_clones = row.second.clones.clone();
+    let grown: usize = table.insert(row).unwrap();
+    assert_eq!(grown, 256);
+    assert_eq!(first_clones.get(), 0);
+    assert_eq!(second_clones.get(), 1);
+    assert_eq!(table.get_by_first(&256).unwrap().0, grown);
+    assert_eq!(table.get_by_second(&256).unwrap().0, grown);
+    assert_eq!(table.iter_by_group(&1).count(), 1);
+    assert_eq!(table.len(), 257);
+    // Growth preserves cached and row-backed key ownership in append-only tables.
     let mut append = AppendCountedRowTable::default();
     assert!(append.is_empty());
     for value in 0..256 {
-        let id: u8 = append
+        let id: usize = append
             .insert(AppendCountedRow::new(value, value, (value % 3) as u8))
             .unwrap();
         assert_eq!(id as u32, value);
         assert_eq!(append.get_by_first(&value).unwrap().0, id);
         assert_eq!(append.get_by_second(&value).unwrap().0, id);
     }
-    let error = append
-        .insert(AppendCountedRow::new(256, 256, 3))
-        .unwrap_err();
-    assert_eq!(error.kind, InsertErrorKind::CapacityExhausted);
-    assert_eq!(error.row.first.clones.get(), 0);
-    assert_eq!(error.row.second.clones.get(), 0);
-    assert_eq!(append.len(), 256);
-    assert_eq!(append.iter().count(), 256);
-    assert!(append.get_by_first(&256).is_none());
-    assert!(append.get_by_second(&256).is_none());
-    assert!(append.iter_by_group(&3).next().is_none());
+    let row = AppendCountedRow::new(256, 256, 3);
+    let first_clones = row.first.clones.clone();
+    let second_clones = row.second.clones.clone();
+    let id: usize = append.insert(row).unwrap();
+    assert_eq!(id, 256);
+    assert_eq!(first_clones.get(), 0);
+    assert_eq!(second_clones.get(), 1);
+    assert_eq!(append.len(), 257);
+    assert_eq!(append.iter().count(), 257);
+    assert_eq!(append.get_by_first(&256).unwrap().0, id);
+    assert_eq!(append.get_by_second(&256).unwrap().0, id);
+    let mut singleton = append.iter_by_group(&3);
+    assert_eq!(singleton.next().unwrap().0, id);
+    assert!(singleton.next().is_none());
+    assert!(singleton.next().is_none());
     for group in 0..3 {
         let mut actual: Vec<_> = append
             .iter_by_group(&group)
@@ -287,9 +295,14 @@ fn exhausted_capacity_does_not_clone_keys() {
     }
     let first = table.get_by_first(&0).unwrap().0;
     table.remove(first);
-    let reused = table.insert(mutable_error.row).unwrap();
-    assert_eq!(reused, first);
+    let row = table.remove(grown).unwrap();
+    assert_eq!(row.first.clones.get(), 0);
+    assert_eq!(row.second.clones.get(), 1);
+    let reused = table.insert(row).unwrap();
+    assert_eq!(reused, grown);
     assert_eq!(table.get_by_first(&256).unwrap().0, reused);
+    assert!(!table.contains(first));
+    assert_eq!(table.len(), 256);
 }
 
 #[table]
@@ -449,15 +462,15 @@ fn replacement_updates_all_indexes_and_preserves_id() {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TinyId(u8);
+struct TinyId(usize);
 
 impl TinyId {
-    fn new(index: u8) -> Self {
-        Self(index)
+    fn new(index: usize) -> Self {
+        Self(index ^ usize::MAX)
     }
 
-    fn index(self) -> u8 {
-        self.0
+    fn index(self) -> usize {
+        self.0 ^ usize::MAX
     }
 }
 
@@ -466,7 +479,6 @@ macro_rules! tiny_row {
         #[table(
             table = $table,
             id = TinyId,
-            index_type = u8,
             id_from_index = TinyId::new,
             id_to_index = |id| id.index(),
             $($option,)*
@@ -486,7 +498,6 @@ macro_rules! tiny_enum {
     ($row:ident $(, $option:meta)*) => {
         #[table(
             id = TinyId,
-            index_type = u8,
             id_from_index = TinyId::new,
             id_to_index = |id| id.index(),
             $($option,)*
@@ -507,24 +518,31 @@ tiny_enum!(TinyItem);
 tiny_enum!(AppendTinyItem, append_only = true);
 
 #[test]
-fn narrow_id_capacity_and_free_list() {
+fn custom_id_growth_and_free_list() {
     macro_rules! fill_enum {
         ($row:ident, $table:ident) => {{
             let mut table = $table::new();
-            for key in 0..128 {
+            for key in 0..160 {
                 let first: TinyId = table.insert($row::First(key)).unwrap();
                 let second: TinyId = table.insert($row::Second(key)).unwrap();
-                assert_eq!(first.index() as u16, key * 2);
-                assert_eq!(second.index() as u16, key * 2 + 1);
+                assert_eq!(first.index(), key as usize * 2);
+                assert_eq!(second.index(), key as usize * 2 + 1);
+                assert_ne!(first.0, first.index());
+                assert_eq!(table.get(first), Some(&$row::First(key)));
+                assert_eq!(table.get(second), Some(&$row::Second(key)));
                 assert_eq!(table.get_first_by_key(&key).unwrap().0, first);
                 assert_eq!(table.get_second_by_key(&key).unwrap().0, second);
             }
+            assert_eq!(table.len(), 320);
+            assert_eq!(table.iter().count(), 320);
             let error = table.insert($row::Second(128)).unwrap_err();
-            assert_eq!(error.kind, InsertErrorKind::CapacityExhausted);
+            assert_eq!(
+                error.kind,
+                InsertErrorKind::Unique {
+                    field: "second_by_key"
+                }
+            );
             assert_eq!(error.row, $row::Second(128));
-            assert!(table.get_second_by_key(&128).is_none());
-            assert_eq!(table.len(), 256);
-            assert_eq!(table.iter().count(), 256);
             for group in 0..2 {
                 for rows in [
                     table
@@ -536,8 +554,9 @@ fn narrow_id_capacity_and_free_list() {
                         .take(257)
                         .collect::<Vec<_>>(),
                 ] {
-                    assert_eq!(rows.len(), 64);
-                    for (_, row) in rows {
+                    assert_eq!(rows.len(), 80);
+                    for (id, row) in rows {
+                        assert_eq!(table.get(id), Some(row));
                         let key = match row {
                             $row::First(key) | $row::Second(key) => key,
                         };
@@ -555,56 +574,76 @@ fn narrow_id_capacity_and_free_list() {
     let second = enum_table.get_second_by_key(&0).unwrap().0;
     enum_table.remove(first);
     enum_table.remove(second);
-    assert_eq!(enum_table.insert(TinyItem::First(128)).unwrap(), second);
-    assert_eq!(enum_table.insert(TinyItem::Second(128)).unwrap(), first);
-    assert_eq!(enum_table.get_first_by_key(&128).unwrap().0, second);
-    assert_eq!(enum_table.get_second_by_key(&128).unwrap().0, first);
-    assert_eq!(enum_table.iter_first_by_group(&0).count(), 64);
-    assert_eq!(enum_table.iter_second_by_group(&0).count(), 64);
+    assert_eq!(enum_table.insert(TinyItem::First(160)).unwrap(), second);
+    assert_eq!(enum_table.insert(TinyItem::Second(160)).unwrap(), first);
+    assert_eq!(enum_table.get_first_by_key(&160).unwrap().0, second);
+    assert_eq!(enum_table.get_second_by_key(&160).unwrap().0, first);
+    enum_table.replace(second, TinyItem::Second(161)).unwrap();
+    assert!(enum_table.get_first_by_key(&160).is_none());
+    assert_eq!(enum_table.get_second_by_key(&161).unwrap().0, second);
+    assert_eq!(enum_table.iter_first_by_group(&0).count(), 79);
+    assert_eq!(enum_table.iter_second_by_group(&0).count(), 80);
+    assert_eq!(enum_table.iter_second_by_group(&1).count(), 81);
 
     let mut table = TinyTable::new();
-    let ids: Vec<_> = (0..=u8::MAX)
-        .map(|group| table.insert(Tiny { group }).unwrap())
+    let ids: Vec<_> = (0..320)
+        .map(|value| {
+            let id = table
+                .insert(Tiny {
+                    group: (value % 2) as u8,
+                })
+                .unwrap();
+            assert_eq!(id.index(), value);
+            assert_ne!(id.0, value);
+            id
+        })
         .collect();
-    assert_eq!(table.len(), 256);
-    let error = table.insert(Tiny { group: 0 }).unwrap_err();
-    assert_eq!(error.kind, InsertErrorKind::CapacityExhausted);
-    assert_eq!(error.row.group, 0);
-    assert_eq!(table.iter_by_group(&0).count(), 1);
+    assert_eq!(table.len(), 320);
+    assert_eq!(table.iter_by_group(&0).take(321).count(), 160);
     table.remove(ids[5]);
     table.remove(ids[8]);
     let a = table.insert(Tiny { group: 0 }).unwrap();
     let b = table.insert(Tiny { group: 0 }).unwrap();
     assert_eq!(a.index(), 8);
     assert_eq!(b.index(), 5);
-    assert_eq!(table.iter_by_group(&0).count(), 3);
-    assert_eq!(table.iter().count(), 256);
+    assert_eq!(table.iter_by_group(&0).take(321).count(), 161);
+    assert_eq!(table.iter().count(), 320);
+    table.replace(a, Tiny { group: 1 }).unwrap();
+    assert_eq!(table.iter_by_group(&0).take(321).count(), 160);
+    assert_eq!(table.iter_by_group(&1).take(321).count(), 160);
 
     let mut append = AppendTinyTable::new();
-    for value in 0..=u8::MAX {
-        let id: TinyId = append.insert(AppendTiny { group: value % 2 }).unwrap();
+    for value in 0..320 {
+        let id: TinyId = append
+            .insert(AppendTiny {
+                group: (value % 2) as u8,
+            })
+            .unwrap();
         assert_eq!(id.index(), value);
+        assert_ne!(id.0, value);
         assert!(append.contains(id));
     }
-    assert_eq!(append.len(), 256);
-    assert_eq!(append.iter().count(), 256);
+    assert_eq!(append.len(), 320);
+    assert_eq!(append.iter().count(), 320);
     for group in 0..2 {
         let mut iter = append.iter_by_group(&group);
-        for _ in 0..128 {
+        for _ in 0..160 {
             assert_eq!(iter.next().unwrap().1.group, group);
         }
         assert!(iter.next().is_none());
         assert!(iter.next().is_none());
     }
     assert!(append.iter_by_group(&2).next().is_none());
-    let error = append.insert(AppendTiny { group: 2 }).unwrap_err();
-    assert_eq!(error.kind, InsertErrorKind::CapacityExhausted);
-    assert_eq!(error.row.group, 2);
-    assert_eq!(append.len(), 256);
-    assert!(append.iter_by_group(&2).next().is_none());
+    let id = append.insert(AppendTiny { group: 2 }).unwrap();
+    assert_eq!(id.index(), 320);
+    assert_eq!(append.len(), 321);
+    let mut singleton = append.iter_by_group(&2);
+    assert_eq!(singleton.next().unwrap().0, id);
+    assert!(singleton.next().is_none());
+    assert!(singleton.next().is_none());
 }
 
-#[table(index_type = u16)]
+#[table]
 struct Plain {
     value: u32,
 }
@@ -612,7 +651,7 @@ struct Plain {
 #[test]
 fn integer_id_reuses_slots() {
     let mut table = PlainTable::new();
-    let first: u16 = table.insert(Plain { value: 1 }).ok().unwrap();
+    let first: usize = table.insert(Plain { value: 1 }).ok().unwrap();
     table.remove(first);
     let next = table.insert(Plain { value: 2 }).ok().unwrap();
     assert_eq!(first, next);
@@ -783,31 +822,29 @@ fn empty_rows_work() {
     assert!(recursive.get_branch_by_tag(&0).is_none());
 }
 
-#[table(index_type = i8)]
+#[table]
 #[derive(Debug)]
 struct Signed {
     #[indexed(unique)]
-    r#type: u8,
+    r#type: u16,
 }
 
 #[test]
-fn signed_backing_and_raw_field_names() {
+fn growth_and_raw_field_names() {
     let mut table = SignedTable::new();
-    for key in 0..128 {
-        let id = table.insert(Signed { r#type: key }).unwrap();
-        assert_eq!(id, key as i8);
+    for key in 0..300 {
+        let id: usize = table.insert(Signed { r#type: key }).unwrap();
+        assert_eq!(id, key as usize);
         assert_eq!(table.get_by_type(&key).unwrap().0, id);
     }
-    assert_eq!(
-        table.insert(Signed { r#type: 128 }).unwrap_err().kind,
-        InsertErrorKind::CapacityExhausted
-    );
-    assert!(table.get_by_type(&128).is_none());
+    assert_eq!(table.len(), 300);
+    assert_eq!(table.get_by_type(&128).unwrap().0, 128);
+    assert_eq!(table.get_by_type(&256).unwrap().0, 256);
     let first = table.get_by_type(&0).unwrap().0;
     table.remove(first);
-    let reused = table.insert(Signed { r#type: 128 }).unwrap();
+    let reused = table.insert(Signed { r#type: 300 }).unwrap();
     assert_eq!(reused, first);
-    assert_eq!(table.get_by_type(&128).unwrap().0, reused);
+    assert_eq!(table.get_by_type(&300).unwrap().0, reused);
 }
 
 #[test]

@@ -15,8 +15,9 @@ use attributes::{IndexMode, IndexOptions, TableOptions};
 
 /// Generate a table from a named-field struct or singleton-tuple-variant enum.
 ///
-/// Options: `table = Name`, `index_type = u32`, and optional `id = Type` with
+/// Options: `table = Name` and optional `id = Type` with
 /// `id_from_index = function_or_closure` and `id_to_index = function_or_closure`.
+/// IDs default to `usize`. Custom ID callbacks convert directly to/from `usize`.
 /// `append_only` selects dense storage and omits removal and replacement methods.
 /// Field attributes: `#[indexed(unique)]` or `#[indexed(many)]`.
 /// Named struct attributes: `#[index(name = pair, unique, fields(a, b))]` or
@@ -211,28 +212,6 @@ fn expand(args: TokenStream2, mut row: ItemStruct) -> syn::Result<TokenStream2> 
     let table = options
         .table
         .unwrap_or_else(|| format_ident!("{}Table", name.unraw()));
-    let index_type = options
-        .index_type
-        .unwrap_or_else(|| syn::parse_quote!(usize));
-    if !matches!(
-        index_type.to_string().as_str(),
-        "u8" | "u16"
-            | "u32"
-            | "u64"
-            | "u128"
-            | "usize"
-            | "i8"
-            | "i16"
-            | "i32"
-            | "i64"
-            | "i128"
-            | "isize"
-    ) {
-        return Err(syn::Error::new(
-            index_type.span(),
-            "index_type must be a primitive integer type",
-        ));
-    }
     if table == name {
         return Err(syn::Error::new(
             name.span(),
@@ -242,7 +221,7 @@ fn expand(args: TokenStream2, mut row: ItemStruct) -> syn::Result<TokenStream2> 
     let (id, id_from_index, id_to_index) =
         match (options.id, options.id_from_index, options.id_to_index) {
             (None, None, None) => (
-                syn::parse_quote!(#index_type),
+                syn::parse_quote!(usize),
                 quote!(|index| index),
                 quote!(|id| id),
             ),
@@ -382,9 +361,10 @@ fn expand(args: TokenStream2, mut row: ItemStruct) -> syn::Result<TokenStream2> 
     };
     let capacity_check = if append_only {
         quote! {
-            let ::std::option::Option::Some(id) = self.__rows.next_id() else {
+            if !self.__rows.can_insert() {
                 return ::std::result::Result::Err(#runtime::InsertError { row, kind: #runtime::InsertErrorKind::CapacityExhausted });
-            };
+            }
+            let id = self.__rows.next_id();
         }
     } else {
         quote! {
@@ -462,17 +442,7 @@ fn expand(args: TokenStream2, mut row: ItemStruct) -> syn::Result<TokenStream2> 
             fn default() -> Self {
                 let __hasher = ::std::collections::hash_map::RandomState::new();
                 Self {
-                    __rows: #arena::new(
-                        |index| {
-                            let index = <#index_type as ::std::convert::TryFrom<usize>>::try_from(index).ok()?;
-                            let convert: fn(#index_type) -> #id = #id_from_index;
-                            ::std::option::Option::Some(convert(index))
-                        },
-                        |id| {
-                            let convert: fn(#id) -> #index_type = #id_to_index;
-                            <usize as ::std::convert::TryFrom<#index_type>>::try_from(convert(id)).ok()
-                        },
-                    ),
+                    __rows: #arena::new(#id_from_index, #id_to_index),
                     #(#map_defaults,)*
                     __hasher,
                 }
@@ -557,14 +527,14 @@ mod tests {
                 quote!(
                     struct Row {}
                 ),
-                "primitive integer",
+                "Unknown field: `index_type`",
             ),
             (
-                quote!(index_type = u8, index_type = u16),
+                quote!(table = First, table = Second),
                 quote!(
                     struct Row {}
                 ),
-                "Duplicate field `index_type`",
+                "Duplicate field `table`",
             ),
             (
                 quote!(unknown = true),
@@ -684,6 +654,42 @@ mod tests {
             let error = expand(args, syn::parse2(item).unwrap()).unwrap_err();
             assert!(error.to_string().contains(message), "{error}");
         }
+        for args in [
+            quote!(id = Id),
+            quote!(id_from_index = Id::new),
+            quote!(id_to_index = Id::index),
+            quote!(id = Id, id_from_index = Id::new),
+            quote!(id = Id, id_to_index = Id::index),
+            quote!(id_from_index = Id::new, id_to_index = Id::index),
+        ] {
+            let item = syn::parse_quote!(
+                struct Row {}
+            );
+            let error = expand(args.clone(), item).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("specify id, id_from_index, and id_to_index together")
+            );
+            let item = syn::parse_quote!(
+                enum Row {
+                    Value(()),
+                }
+            );
+            let error = enums::expand(args, item).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("specify id, id_from_index, and id_to_index together")
+            );
+        }
+        let item = syn::parse_quote!(
+            enum Row {
+                Value(()),
+            }
+        );
+        let error = enums::expand(quote!(index_type = u8), item).unwrap_err();
+        assert!(error.to_string().contains("Unknown field: `index_type`"));
         for item in [
             quote!(
                 enum Row {

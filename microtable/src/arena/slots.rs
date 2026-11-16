@@ -7,7 +7,7 @@
 //!
 //! No caller can access the union or mutate the occupancy bits directly.
 
-use bitvec::vec::BitVec;
+use bitvec::{slice::BitSlice, vec::BitVec};
 use std::{mem::ManuallyDrop, num::NonZeroUsize};
 
 // Encoding index + 1 allows a free-list link to occupy a single machine word.
@@ -45,7 +45,24 @@ impl<T> Slots<T> {
         self.free.map_or(self.slots.len(), |link| link.get() - 1)
     }
 
+    fn can_insert_at(slots_len: usize, len: usize, has_free: bool) -> bool {
+        if len.checked_add(1).is_none() {
+            return false;
+        }
+        has_free
+            || (super::vec_can_grow::<Slot<T>>(slots_len)
+                // Every slot index must support the nonzero index + 1 encoding.
+                && slots_len
+                    .checked_add(1)
+                    .is_some_and(|next_len| next_len <= BitSlice::<usize>::MAX_BITS))
+    }
+
+    pub fn can_insert(&self) -> bool {
+        Self::can_insert_at(self.slots.len(), self.len, self.free.is_some())
+    }
+
     pub fn insert(&mut self, value: T) -> usize {
+        assert!(self.can_insert(), "arena structural capacity exhausted");
         let index = self.next_index();
         if self.free.is_some() {
             // SAFETY: The free-list head is vacant and has initialized next_free.
@@ -162,5 +179,17 @@ mod tests {
         struct Aligned;
         assert_eq!(size_of::<Slot<Aligned>>(), 64);
         assert_eq!(align_of::<Slot<Aligned>>(), 64);
+
+        let slot_limit = isize::MAX as usize / size_of::<Slot<u8>>();
+        let limit = slot_limit.min(BitSlice::<usize>::MAX_BITS);
+        assert!(Slots::<u8>::can_insert_at(limit - 1, limit - 1, false));
+        assert!(!Slots::<u8>::can_insert_at(limit, limit, false));
+        assert!(Slots::<u8>::can_insert_at(limit, limit - 1, true));
+        assert!(!Slots::<u8>::can_insert_at(usize::MAX, 0, false));
+        assert!(!Slots::<u8>::can_insert_at(0, usize::MAX, true));
+        assert!(super::super::vec_can_grow::<()>(usize::MAX - 1));
+        assert!(!super::super::vec_can_grow::<()>(usize::MAX));
+        assert!(super::super::vec_can_grow::<u8>(isize::MAX as usize - 1));
+        assert!(!super::super::vec_can_grow::<u8>(isize::MAX as usize));
     }
 }

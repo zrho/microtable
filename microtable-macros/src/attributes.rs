@@ -11,7 +11,6 @@ pub(super) struct TableOptions {
     pub append_only: bool,
     pub table: Option<syn::Ident>,
     pub id: Option<syn::Type>,
-    pub index_type: Option<syn::Ident>,
     pub id_from_index: Option<syn::Expr>,
     pub id_to_index: Option<syn::Expr>,
 }

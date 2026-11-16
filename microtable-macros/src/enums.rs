@@ -23,28 +23,6 @@ pub(super) fn expand(args: TokenStream2, mut row: syn::ItemEnum) -> syn::Result<
     let table = options
         .table
         .unwrap_or_else(|| format_ident!("{}Table", name.unraw()));
-    let index_type = options
-        .index_type
-        .unwrap_or_else(|| syn::parse_quote!(usize));
-    if !matches!(
-        index_type.to_string().as_str(),
-        "u8" | "u16"
-            | "u32"
-            | "u64"
-            | "u128"
-            | "usize"
-            | "i8"
-            | "i16"
-            | "i32"
-            | "i64"
-            | "i128"
-            | "isize"
-    ) {
-        return Err(syn::Error::new(
-            index_type.span(),
-            "index_type must be a primitive integer type",
-        ));
-    }
     if table == name {
         return Err(syn::Error::new(
             name.span(),
@@ -54,7 +32,7 @@ pub(super) fn expand(args: TokenStream2, mut row: syn::ItemEnum) -> syn::Result<
     let (id, id_from_index, id_to_index): (syn::Type, _, _) =
         match (options.id, options.id_from_index, options.id_to_index) {
             (None, None, None) => (
-                syn::parse_quote!(#index_type),
+                syn::parse_quote!(usize),
                 quote!(|index| index),
                 quote!(|id| id),
             ),
@@ -196,9 +174,10 @@ pub(super) fn expand(args: TokenStream2, mut row: syn::ItemEnum) -> syn::Result<
     };
     let capacity_check = if append_only {
         quote! {
-            let ::std::option::Option::Some(id) = self.__rows.next_id() else {
+            if !self.__rows.can_insert() {
                 return ::std::result::Result::Err(#runtime::InsertError { row, kind: #runtime::InsertErrorKind::CapacityExhausted });
-            };
+            }
+            let id = self.__rows.next_id();
         }
     } else {
         quote! {
@@ -396,17 +375,7 @@ pub(super) fn expand(args: TokenStream2, mut row: syn::ItemEnum) -> syn::Result<
             fn default() -> Self {
                 let __hasher = ::std::collections::hash_map::RandomState::new();
                 Self {
-                    __rows: #arena::new(
-                        |index| {
-                            let index = <#index_type as ::std::convert::TryFrom<usize>>::try_from(index).ok()?;
-                            let convert: fn(#index_type) -> #id = #id_from_index;
-                            ::std::option::Option::Some(convert(index))
-                        },
-                        |id| {
-                            let convert: fn(#id) -> #index_type = #id_to_index;
-                            <usize as ::std::convert::TryFrom<#index_type>>::try_from(convert(id)).ok()
-                        },
-                    ),
+                    __rows: #arena::new(#id_from_index, #id_to_index),
                     #(#map_defaults,)*
                     __hasher,
                 }

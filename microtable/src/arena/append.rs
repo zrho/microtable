@@ -2,12 +2,12 @@
 
 pub struct AppendArena<T, Id> {
     values: Vec<T>,
-    from_index: fn(usize) -> Option<Id>,
-    to_index: fn(Id) -> Option<usize>,
+    from_index: fn(usize) -> Id,
+    to_index: fn(Id) -> usize,
 }
 
 impl<T, Id: Copy> AppendArena<T, Id> {
-    pub fn new(from_index: fn(usize) -> Option<Id>, to_index: fn(Id) -> Option<usize>) -> Self {
+    pub fn new(from_index: fn(usize) -> Id, to_index: fn(Id) -> usize) -> Self {
         Self {
             values: Vec::new(),
             from_index,
@@ -23,7 +23,12 @@ impl<T, Id: Copy> AppendArena<T, Id> {
         self.values.is_empty()
     }
 
-    pub fn next_id(&self) -> Option<Id> {
+    // Structural capacity only; allocation failure is not recoverable here.
+    pub fn can_insert(&self) -> bool {
+        super::vec_can_grow::<T>(self.values.len())
+    }
+
+    pub fn next_id(&self) -> Id {
         (self.from_index)(self.values.len())
     }
 
@@ -31,28 +36,24 @@ impl<T, Id: Copy> AppendArena<T, Id> {
         self.values.reserve(additional);
     }
 
-    // Generated code checks next_id before building the row's cyclic links.
-    // Pushing must not call the ID conversion again.
+    // Generated code checks can_insert, calls next_id once, then reserves before
+    // building the row's cyclic links. Push must not convert the ID again.
     pub fn push(&mut self, value: T) {
         self.values.push(value);
     }
 
     pub fn get(&self, id: Id) -> Option<&T> {
-        let index = (self.to_index)(id)?;
-        self.values.get(index)
+        self.values.get((self.to_index)(id))
     }
 
     pub fn get_mut(&mut self, id: Id) -> Option<&mut T> {
-        let index = (self.to_index)(id)?;
-        self.values.get_mut(index)
+        self.values.get_mut((self.to_index)(id))
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (Id, &T)> {
-        self.values.iter().enumerate().map(|(index, value)| {
-            (
-                (self.from_index)(index).expect("valid occupied slot"),
-                value,
-            )
-        })
+        self.values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| ((self.from_index)(index), value))
     }
 }

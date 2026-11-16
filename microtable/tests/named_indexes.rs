@@ -1,8 +1,21 @@
 use microtable::{InsertErrorKind, ReplaceErrorKind, table};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct NamedId(usize);
+
+impl NamedId {
+    fn new(index: usize) -> Self {
+        Self(index ^ (1usize << (usize::BITS - 1)))
+    }
+
+    fn index(self) -> usize {
+        self.0 ^ (1usize << (usize::BITS - 1))
+    }
+}
+
 macro_rules! member_row {
     ($row:ident, $table:ident, $make:ident, $group:ident $(, $option:meta)*) => {
-        #[table(table = $table $(, $option)*)]
+        #[table(table = $table, id = NamedId, id_from_index = NamedId::new, id_to_index = NamedId::index $(, $option)*)]
         #[index(name = tenant_handle, unique, fields(tenant, handle))]
         #[index(name = tenant_category, many, cached, fields(tenant, category))]
         #[index(name = normalized, unique, cached = false, key_type = String, key = |row| format!("{}:{}", row.tenant, row.handle.to_ascii_lowercase()))]
@@ -63,7 +76,7 @@ fn item_payload(serial: u32, email: &str, kind: &str) -> ItemPayload {
 
 macro_rules! item_enum {
     ($row:ident $(, $option:meta)*) => {
-        #[table($($option),*)]
+        #[table(id = NamedId, id_from_index = NamedId::new, id_to_index = NamedId::index $(, $option)*)]
         #[derive(Debug, PartialEq, Eq)]
         enum $row {
             #[index(name = email, unique, key_type = String, key = |payload| payload.email.clone())]
@@ -742,7 +755,7 @@ fn computed_keys_are_cached_for_removal_and_old_replacement_keys() {
 #[test]
 fn randomized_named_index_operations_match_a_scan_model() {
     let mut table = MemberTable::new();
-    let mut model = std::collections::HashMap::<usize, Member>::new();
+    let mut model = std::collections::HashMap::<NamedId, Member>::new();
     let mut history = Vec::new();
     let mut seed = 19u64;
     for _ in 0..1500 {

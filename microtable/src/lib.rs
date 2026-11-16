@@ -1,7 +1,7 @@
 //! Tables generated from named-field structs or enums by [`macro@table`].
 //!
 //! ```
-//! #[microtable::table(index_type = u32)]
+//! #[microtable::table]
 //! #[derive(Debug)]
 //! struct Person {
 //!     #[indexed(unique)]
@@ -55,6 +55,16 @@
 //! also works for enums and omits `replace` and `remove`. Generated row metadata
 //! is an enum that stores index links and cached hashes only for the active
 //! variant, not for every variant.
+//!
+//! # Row IDs and storage indices
+//!
+//! Row IDs default to `usize`. A custom `id = Type` requires both
+//! `id_from_index: fn(usize) -> Id` and `id_to_index: fn(Id) -> usize`.
+//! Callbacks can be function paths or non-capturing closures. They must be
+//! deterministic, nonpanicking inverses over valid slot indices. IDs require
+//! `Copy + Eq`, but no numeric or `Hash` bounds. Internal index entries and row
+//! links use the ID type; storage offsets, lengths, bitmap positions, and
+//! free-list links use `usize`. ID types do not impose automatic capacity limits.
 //!
 //! # Append-only tables
 //!
@@ -110,7 +120,10 @@ pub use microtable_macros::table;
 /// Why an insertion failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InsertErrorKind {
-    Unique { field: &'static str },
+    Unique {
+        field: &'static str,
+    },
+    /// The storage cannot represent another row. Does not report allocation failures.
     CapacityExhausted,
 }
 
@@ -127,7 +140,7 @@ impl<T> std::fmt::Display for InsertError<T> {
             InsertErrorKind::Unique { field } => {
                 write!(f, "unique index `{field}` already contains this value")
             }
-            InsertErrorKind::CapacityExhausted => f.write_str("row ID capacity exhausted"),
+            InsertErrorKind::CapacityExhausted => f.write_str("table capacity exhausted"),
         }
     }
 }

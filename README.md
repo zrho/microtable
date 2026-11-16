@@ -5,7 +5,7 @@ indexes. The workspace contains `microtable` (runtime storage and errors)
 and `microtable-macros` (the attribute macro, re-exported by `microtable`).
 
 ```rust
-#[microtable::table(index_type = u32)]
+#[microtable::table]
 #[derive(Debug)]
 pub struct Person {
     #[indexed(unique)]
@@ -16,7 +16,7 @@ pub struct Person {
 }
 
 let mut people = PersonTable::new();
-let id: u32 = people.insert(Person {
+let id: usize = people.insert(Person {
     email: "ada@example.com".into(),
     team: "engineering".into(),
     name: "Ada".into(),
@@ -50,12 +50,11 @@ Configure the table and use a custom ID type with:
 
 ```rust
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct PersonKey(u16);
+struct PersonKey(usize);
 
 #[microtable::table(
     table = People,
     id = PersonKey,
-    index_type = u16,
     id_from_index = |index| PersonKey(index),
     id_to_index = |id| id.0,
 )]
@@ -64,15 +63,15 @@ struct Person {
 }
 ```
 
-The table name defaults to `<Row>Table`, and `index_type` defaults to `usize`.
-Row IDs use `index_type` directly unless a custom `id` type is specified.
-A custom ID requires both `id_from_index: fn(Index) -> Id` and
-`id_to_index: fn(Id) -> Index`. Each callback accepts a function path, such as
+The table name defaults to `<Row>Table`. Row IDs default to `usize`.
+A custom ID requires both `id_from_index: fn(usize) -> Id` and
+`id_to_index: fn(Id) -> usize`. Each callback accepts a function path, such as
 `PersonKey::new`, or a non-capturing closure. The ID type must implement
-`Copy + Eq`. The callbacks must be deterministic inverses and must not panic.
-`index_type` accepts primitive signed or unsigned integer types. Only nonnegative
-slot indices are used, and storage is also limited by the platform's `usize`.
-For example, `u8` supports 256 allocated slots, while `i8` supports 128.
+`Copy + Eq`. Both callbacks are infallible: they must be deterministic,
+nonpanicking inverses for all valid slot indices. There are no automatic
+capacity limits for narrow custom IDs. The mapping must support every slot
+index that the table uses. Slot offsets, lengths, and free-list links use `usize`;
+row references in indexes and list links use the ID type.
 
 Generated tables provide:
 
@@ -99,8 +98,8 @@ is immutable; change rows through `replace` in mutable tables.
 Use `#[microtable::table(append_only)]` or `append_only = true` when rows must
 not be removed or replaced. These tables retain `insert`, read methods, full
 and indexed iteration, `new`, `default`, `len`, and `is_empty`; `remove` and
-`replace` are not generated. Index cache options and defaults, custom IDs, and
-`index_type` work as in mutable tables.
+`replace` are not generated. Index cache options and defaults and custom IDs
+work as in mutable tables.
 
 Append-only rows use a dense `Vec`, with no vacant slots or free list. Each many
 index stores one plain ID successor per row in a circular group, with a stable
@@ -207,6 +206,8 @@ A computed tuple key is queried using a reference to that tuple.
 
 Insertion errors expose the rejected `row` and a `kind`:
 `InsertErrorKind::Unique { field }` or `InsertErrorKind::CapacityExhausted`.
+`CapacityExhausted` means real storage or slot-index-space exhaustion, not a
+narrow-ID limit. It does not recover from out-of-memory allocation failures.
 Replacement errors similarly expose the rejected row, with
 `ReplaceErrorKind::Unique { field }` or `ReplaceErrorKind::NotFound`.
 For a named index, `field` contains the index name. Field indexes are validated

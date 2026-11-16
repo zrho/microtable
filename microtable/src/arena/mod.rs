@@ -13,12 +13,12 @@ mod slots;
 
 pub struct Arena<T, Id> {
     slots: Slots<T>,
-    from_index: fn(usize) -> Option<Id>,
-    to_index: fn(Id) -> Option<usize>,
+    from_index: fn(usize) -> Id,
+    to_index: fn(Id) -> usize,
 }
 
 impl<T, Id: Copy> Arena<T, Id> {
-    pub fn new(from_index: fn(usize) -> Option<Id>, to_index: fn(Id) -> Option<usize>) -> Self {
+    pub fn new(from_index: fn(usize) -> Id, to_index: fn(Id) -> usize) -> Self {
         Self {
             slots: Slots::default(),
             from_index,
@@ -34,45 +34,50 @@ impl<T, Id: Copy> Arena<T, Id> {
         self.len() == 0
     }
 
-    fn next_id(&self) -> Option<Id> {
+    fn next_id(&self) -> Id {
         (self.from_index)(self.slots.next_index())
     }
 
+    // Structural capacity only; allocation failure is not recoverable here.
     pub fn can_insert(&self) -> bool {
-        self.next_id().is_some()
+        self.slots.can_insert()
     }
 
     pub fn insert(&mut self, value: T) -> Result<Id, T> {
-        let Some(id) = self.next_id() else {
+        if !self.can_insert() {
             return Err(value);
-        };
+        }
+        let id = self.next_id();
         self.slots.insert(value);
         Ok(id)
     }
 
     pub fn get(&self, id: Id) -> Option<&T> {
-        let index = (self.to_index)(id)?;
-        self.slots.get(index)
+        self.slots.get((self.to_index)(id))
     }
 
     pub fn get_mut(&mut self, id: Id) -> Option<&mut T> {
-        let index = (self.to_index)(id)?;
-        self.slots.get_mut(index)
+        self.slots.get_mut((self.to_index)(id))
     }
 
     pub fn remove(&mut self, id: Id) -> Option<T> {
-        let index = (self.to_index)(id)?;
-        self.slots.remove(index)
+        self.slots.remove((self.to_index)(id))
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (Id, &T)> {
-        self.slots.iter().map(|(index, value)| {
-            (
-                (self.from_index)(index).expect("valid occupied slot"),
-                value,
-            )
-        })
+        self.slots
+            .iter()
+            .map(|(index, value)| ((self.from_index)(index), value))
     }
+}
+
+// Vec allocations must fit in isize::MAX bytes. ZSTs only limit length.
+fn vec_can_grow<T>(len: usize) -> bool {
+    let Some(next_len) = len.checked_add(1) else {
+        return false;
+    };
+    let size = std::mem::size_of::<T>();
+    size == 0 || next_len <= isize::MAX as usize / size
 }
 
 #[cfg(test)]
