@@ -482,8 +482,86 @@ macro_rules! tiny_row {
 tiny_row!(Tiny, TinyTable);
 tiny_row!(AppendTiny, AppendTinyTable, append_only = true);
 
+macro_rules! tiny_enum {
+    ($row:ident $(, $option:meta)*) => {
+        #[table(
+            id = TinyId,
+            index_type = u8,
+            id_from_index = TinyId::new,
+            id_to_index = |id| id.index(),
+            $($option,)*
+        )]
+        #[derive(Debug, PartialEq, Eq)]
+        enum $row {
+            #[index(name = key, unique, key_type = u16, key = |payload| *payload)]
+            #[index(name = group, many, key_type = u8, key = |payload| (*payload % 2) as u8)]
+            First(u16),
+            #[index(name = key, unique, cached = false, key_type = u16, key = |payload| *payload)]
+            #[index(name = group, many, cached = false, key_type = u8, key = |payload| (*payload % 2) as u8)]
+            Second(u16),
+        }
+    };
+}
+
+tiny_enum!(TinyItem);
+tiny_enum!(AppendTinyItem, append_only = true);
+
 #[test]
 fn narrow_id_capacity_and_free_list() {
+    macro_rules! fill_enum {
+        ($row:ident, $table:ident) => {{
+            let mut table = $table::new();
+            for key in 0..128 {
+                let first: TinyId = table.insert($row::First(key)).unwrap();
+                let second: TinyId = table.insert($row::Second(key)).unwrap();
+                assert_eq!(first.index() as u16, key * 2);
+                assert_eq!(second.index() as u16, key * 2 + 1);
+                assert_eq!(table.get_first_by_key(&key).unwrap().0, first);
+                assert_eq!(table.get_second_by_key(&key).unwrap().0, second);
+            }
+            let error = table.insert($row::Second(128)).unwrap_err();
+            assert_eq!(error.kind, InsertErrorKind::CapacityExhausted);
+            assert_eq!(error.row, $row::Second(128));
+            assert!(table.get_second_by_key(&128).is_none());
+            assert_eq!(table.len(), 256);
+            assert_eq!(table.iter().count(), 256);
+            for group in 0..2 {
+                for rows in [
+                    table
+                        .iter_first_by_group(&group)
+                        .take(257)
+                        .collect::<Vec<_>>(),
+                    table
+                        .iter_second_by_group(&group)
+                        .take(257)
+                        .collect::<Vec<_>>(),
+                ] {
+                    assert_eq!(rows.len(), 64);
+                    for (_, row) in rows {
+                        let key = match row {
+                            $row::First(key) | $row::Second(key) => key,
+                        };
+                        assert_eq!((*key % 2) as u8, group);
+                    }
+                }
+            }
+            assert!(table.iter_first_by_group(&2).next().is_none());
+            table
+        }};
+    }
+    let mut enum_table = fill_enum!(TinyItem, TinyItemTable);
+    let _ = fill_enum!(AppendTinyItem, AppendTinyItemTable);
+    let first = enum_table.get_first_by_key(&0).unwrap().0;
+    let second = enum_table.get_second_by_key(&0).unwrap().0;
+    enum_table.remove(first);
+    enum_table.remove(second);
+    assert_eq!(enum_table.insert(TinyItem::First(128)).unwrap(), second);
+    assert_eq!(enum_table.insert(TinyItem::Second(128)).unwrap(), first);
+    assert_eq!(enum_table.get_first_by_key(&128).unwrap().0, second);
+    assert_eq!(enum_table.get_second_by_key(&128).unwrap().0, first);
+    assert_eq!(enum_table.iter_first_by_group(&0).count(), 64);
+    assert_eq!(enum_table.iter_second_by_group(&0).count(), 64);
+
     let mut table = TinyTable::new();
     let ids: Vec<_> = (0..=u8::MAX)
         .map(|group| table.insert(Tiny { group }).unwrap())
@@ -662,6 +740,47 @@ fn empty_rows_work() {
     let mut ids: Vec<_> = append.iter().map(|(id, _)| id).collect();
     ids.sort_unstable();
     assert_eq!(ids, [first, second]);
+
+    #[table]
+    #[derive(Debug)]
+    enum Singleton {
+        #[index(name = value, unique, key_type = u32, key = |value| *value)]
+        #[index(name = bucket, many, cached = false, key_type = u32, key = |value| *value % 2)]
+        Value(u32),
+    }
+    let mut single = SingletonTable::new();
+    let id = single.insert(Singleton::Value(2)).unwrap();
+    single.replace(id, Singleton::Value(2)).unwrap();
+    assert_eq!(single.get_value_by_value(&2).unwrap().0, id);
+    assert_eq!(single.iter_value_by_bucket(&0).count(), 1);
+    single.remove(id).unwrap();
+    assert!(single.get_value_by_value(&2).is_none());
+    assert!(single.iter_value_by_bucket(&0).next().is_none());
+
+    #[table(append_only)]
+    #[derive(Debug)]
+    enum Unindexed {
+        Value(()),
+    }
+    let mut unindexed = UnindexedTable::new();
+    let id = unindexed.insert(Unindexed::Value(())).unwrap();
+    assert!(unindexed.get(id).is_some());
+    assert_eq!(unindexed.iter().count(), 1);
+
+    #[table]
+    #[derive(Debug)]
+    enum Recursive {
+        #[index(name = tag, unique, key_type = u8, key = |_| 0)]
+        Branch(Box<Self>),
+        Leaf(()),
+    }
+    let mut recursive = RecursiveTable::new();
+    let id = recursive
+        .insert(Recursive::Branch(Box::new(Recursive::Leaf(()))))
+        .unwrap();
+    assert_eq!(recursive.get_branch_by_tag(&0).unwrap().0, id);
+    recursive.replace(id, Recursive::Leaf(())).unwrap();
+    assert!(recursive.get_branch_by_tag(&0).is_none());
 }
 
 #[table(index_type = i8)]

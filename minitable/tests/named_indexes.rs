@@ -46,8 +46,141 @@ member_row!(
     append_only
 );
 
+#[derive(Debug, PartialEq, Eq)]
+struct ItemPayload {
+    email: String,
+    serial: u32,
+    kind: String,
+}
+
+fn item_payload(serial: u32, email: &str, kind: &str) -> ItemPayload {
+    ItemPayload {
+        email: email.into(),
+        serial,
+        kind: kind.into(),
+    }
+}
+
+macro_rules! item_enum {
+    ($row:ident $(, $option:meta)*) => {
+        #[table($($option),*)]
+        #[derive(Debug, PartialEq, Eq)]
+        enum $row {
+            #[index(name = email, unique, key_type = String, key = |payload| payload.email.clone())]
+            #[index(name = serial, unique, cached = false, key_type = u32, key = |payload| payload.serial)]
+            #[index(name = kind, many, key_type = String, key = |payload| payload.kind.clone())]
+            #[index(name = live_kind, many, cached = false, key_type = String, key = |payload| payload.kind.clone())]
+            Person(ItemPayload),
+            #[index(name = email, unique, cached = false, key_type = String, key = |payload| payload.email.clone())]
+            #[index(name = serial, unique, key_type = u32, key = |payload| payload.serial)]
+            #[index(name = kind, many, cached = false, key_type = String, key = |payload| payload.kind.clone())]
+            #[index(name = cached_kind, many, cached = true, key_type = String, key = |payload| payload.kind.clone())]
+            Device(ItemPayload),
+            Unindexed(()),
+        }
+    };
+}
+
+item_enum!(Item);
+item_enum!(AppendItem, append_only);
+
 #[test]
 fn named_indexes_coexist_and_support_borrowed_queries() {
+    macro_rules! check_enum {
+        ($row:ident, $table:ident) => {{
+            let mut table = $table::default();
+            assert!(table.iter_person_by_kind("shared").next().is_none());
+            assert!(table.iter_device_by_kind("shared").next().is_none());
+            let a = table
+                .insert($row::Person(item_payload(1, "same", "shared")))
+                .unwrap();
+            let b = table
+                .insert($row::Device(item_payload(1, "same", "shared")))
+                .unwrap();
+            let unindexed = table.insert($row::Unindexed(())).unwrap();
+            assert_eq!(
+                table.get_person_by_email("same"),
+                Some((a, table.get(a).unwrap()))
+            );
+            assert_eq!(
+                table.get_device_by_email("same"),
+                Some((b, table.get(b).unwrap()))
+            );
+            assert_eq!(table.get_person_by_serial(&1).unwrap().0, a);
+            assert_eq!(table.get_device_by_serial(&1).unwrap().0, b);
+            macro_rules! singleton {
+                ($iter:expr, $id:expr) => {{
+                    let mut iter = $iter;
+                    assert_eq!(iter.next().unwrap().0, $id);
+                    assert!(iter.next().is_none());
+                    assert!(iter.next().is_none());
+                }};
+            }
+            singleton!(table.iter_person_by_kind("shared"), a);
+            singleton!(table.iter_person_by_live_kind("shared"), a);
+            singleton!(table.iter_device_by_kind("shared"), b);
+            singleton!(table.iter_device_by_cached_kind("shared"), b);
+            let c = table
+                .insert($row::Person(item_payload(2, "person-only", "shared")))
+                .unwrap();
+            let d = table
+                .insert($row::Device(item_payload(2, "device-only", "shared")))
+                .unwrap();
+            assert!(table.get_device_by_email("person-only").is_none());
+            assert!(table.get_person_by_email("device-only").is_none());
+            for iter in [
+                table.iter_person_by_kind("shared").collect::<Vec<_>>(),
+                table.iter_person_by_live_kind("shared").collect(),
+            ] {
+                let mut ids: Vec<_> = iter
+                    .into_iter()
+                    .map(|(id, row)| {
+                        assert!(matches!(row, $row::Person(_)));
+                        id
+                    })
+                    .collect();
+                ids.sort_unstable();
+                assert_eq!(ids, [a, c]);
+            }
+            for iter in [
+                table.iter_device_by_kind("shared").collect::<Vec<_>>(),
+                table.iter_device_by_cached_kind("shared").collect(),
+            ] {
+                let mut ids: Vec<_> = iter
+                    .into_iter()
+                    .map(|(id, row)| {
+                        assert!(matches!(row, $row::Device(_)));
+                        id
+                    })
+                    .collect();
+                ids.sort_unstable();
+                assert_eq!(ids, [b, d]);
+            }
+            for row in [
+                $row::Person(item_payload(3, "same", "rejected")),
+                $row::Person(item_payload(1, "unused", "rejected")),
+                $row::Device(item_payload(3, "same", "rejected")),
+                $row::Device(item_payload(1, "unused", "rejected")),
+            ] {
+                let error = table.insert(row).unwrap_err();
+                assert!(matches!(error.kind, InsertErrorKind::Unique { .. }));
+                assert_eq!(table.len(), 5);
+                assert!(table.get_person_by_email("unused").is_none());
+                assert!(table.get_device_by_email("unused").is_none());
+                assert_eq!(table.iter_person_by_kind("rejected").count(), 0);
+                assert_eq!(table.iter_device_by_kind("rejected").count(), 0);
+            }
+            assert_eq!(table.get(unindexed), Some(&$row::Unindexed(())));
+            let matches = {
+                let query = String::from("shared");
+                table.iter_device_by_kind(query.as_str())
+            };
+            assert_eq!(matches.take(3).count(), 2);
+            assert!(table.iter_device_by_cached_kind("missing").next().is_none());
+        }};
+    }
+    check_enum!(Item, ItemTable);
+    check_enum!(AppendItem, AppendItemTable);
     macro_rules! check {
         ($table:ty, $member:path, $group:path) => {{
             let mut table = <$table>::new();
@@ -137,6 +270,77 @@ fn named_constraints_leave_all_indexes_unchanged_on_error() {
 
 #[test]
 fn replacement_and_removal_update_composite_and_computed_lists() {
+    let mut items = ItemTable::new();
+    let a = items
+        .insert(Item::Person(item_payload(1, "same", "red")))
+        .unwrap();
+    let b = items
+        .insert(Item::Person(item_payload(2, "other", "red")))
+        .unwrap();
+    let d = items
+        .insert(Item::Device(item_payload(1, "same", "red")))
+        .unwrap();
+    // Both target-variant unique constraints must be checked before old links detach.
+    for row in [
+        Item::Device(item_payload(3, "same", "blue")),
+        Item::Device(item_payload(1, "unused", "blue")),
+    ] {
+        let error = items.replace(b, row).unwrap_err();
+        assert!(matches!(error.kind, ReplaceErrorKind::Unique { .. }));
+        assert_eq!(
+            items.get(b),
+            Some(&Item::Person(item_payload(2, "other", "red")))
+        );
+        assert_eq!(items.get_person_by_email("other").unwrap().0, b);
+        assert_eq!(items.get_person_by_serial(&2).unwrap().0, b);
+        assert_eq!(items.get_device_by_email("same").unwrap().0, d);
+        assert_eq!(items.iter_person_by_kind("red").count(), 2);
+        assert_eq!(items.iter_person_by_live_kind("red").count(), 2);
+        assert_eq!(items.iter_device_by_kind("red").count(), 1);
+        assert_eq!(items.iter_device_by_cached_kind("red").count(), 1);
+        assert_eq!(items.iter_device_by_kind("blue").count(), 0);
+        assert_eq!(items.iter_device_by_cached_kind("blue").count(), 0);
+        assert!(items.get_device_by_email("unused").is_none());
+    }
+    assert_eq!(
+        items
+            .replace(b, Item::Device(item_payload(2, "other", "red")))
+            .unwrap(),
+        Item::Person(item_payload(2, "other", "red"))
+    );
+    assert!(items.get_person_by_email("other").is_none());
+    assert!(items.get_person_by_serial(&2).is_none());
+    assert_eq!(items.get_device_by_email("other").unwrap().0, b);
+    assert_eq!(items.iter_person_by_kind("red").count(), 1);
+    assert_eq!(items.iter_person_by_live_kind("red").count(), 1);
+    assert_eq!(items.iter_device_by_kind("red").count(), 2);
+    assert_eq!(items.iter_device_by_cached_kind("red").count(), 2);
+    items
+        .replace(b, Item::Person(item_payload(2, "other", "blue")))
+        .unwrap();
+    assert!(items.get_device_by_email("other").is_none());
+    assert!(items.get_device_by_serial(&2).is_none());
+    assert_eq!(items.iter_device_by_kind("red").count(), 1);
+    assert_eq!(items.iter_device_by_cached_kind("red").count(), 1);
+    assert_eq!(items.iter_person_by_kind("blue").next().unwrap().0, b);
+    assert_eq!(items.iter_person_by_live_kind("blue").next().unwrap().0, b);
+    items.replace(b, Item::Unindexed(())).unwrap();
+    assert!(items.get_person_by_email("other").is_none());
+    assert_eq!(items.iter_person_by_kind("blue").count(), 0);
+    assert_eq!(items.iter_person_by_live_kind("blue").count(), 0);
+    items.remove(a);
+    items.remove(d);
+    assert_eq!(items.iter_person_by_kind("red").count(), 0);
+    assert_eq!(items.iter_person_by_live_kind("red").count(), 0);
+    assert_eq!(items.iter_device_by_kind("red").count(), 0);
+    assert_eq!(items.iter_device_by_cached_kind("red").count(), 0);
+    items
+        .replace(b, Item::Device(item_payload(1, "same", "red")))
+        .unwrap();
+    assert_eq!(items.get_device_by_email("same").unwrap().0, b);
+    items.remove(b);
+    assert!(items.is_empty());
+
     let mut table = MemberTable::new();
     let a = table.insert(member(1, 1, "Ada", "red")).unwrap();
     let b = table.insert(member(2, 1, "Grace", "red")).unwrap();
@@ -186,8 +390,85 @@ macro_rules! generic_row {
 generic_row!(Generic);
 generic_row!(AppendGeneric, append_only = true);
 
+struct GenericPayload<'a, T, const N: usize> {
+    key: T,
+    label: &'a str,
+    data: [u8; N],
+}
+
+macro_rules! generic_enum {
+    ($row:ident $(, $option:meta)*) => {
+        #[table($($option),*)]
+        enum $row<'a, T, const N: usize>
+        where
+            T: Clone + Eq + std::hash::Hash,
+        {
+            #[index(name = key, unique, key_type = T, key = |payload| payload.key.clone())]
+            #[index(name = borrowed, many, key_type = &'a str, key = |payload| payload.label)]
+            Value(GenericPayload<'a, T, N>),
+            #[index(name = key, unique, cached = false, key_type = T, key = |payload| payload.key.clone())]
+            #[index(name = borrowed, many, cached = false, key_type = &'a str, key = |payload| payload.label)]
+            Alternate(GenericPayload<'a, T, N>),
+        }
+    };
+}
+
+generic_enum!(GenericItem);
+generic_enum!(AppendGenericItem, append_only);
+
 #[test]
 fn named_indexes_support_generics_and_borrowed_computed_outputs() {
+    let borrowed = String::from("enum label");
+    macro_rules! check_enum {
+        ($row:ident, $table:ident) => {{
+            let mut table = $table::<String, 3>::new();
+            let a = table
+                .insert($row::Value(GenericPayload {
+                    key: "shared".into(),
+                    label: &borrowed,
+                    data: [1, 2, 3],
+                }))
+                .ok()
+                .unwrap();
+            let b = table
+                .insert($row::Alternate(GenericPayload {
+                    key: "shared".into(),
+                    label: &borrowed,
+                    data: [4, 5, 6],
+                }))
+                .ok()
+                .unwrap();
+            assert_eq!(table.get_value_by_key("shared").unwrap().0, a);
+            assert_eq!(table.get_alternate_by_key("shared").unwrap().0, b);
+            let matches = {
+                let query = String::from("enum label");
+                table.iter_value_by_borrowed(query.as_str())
+            };
+            let mut matches = matches;
+            let (id, row) = matches.next().unwrap();
+            assert_eq!(id, a);
+            match row {
+                $row::Value(payload) => assert_eq!(payload.data, [1, 2, 3]),
+                _ => panic!("wrong variant"),
+            }
+            assert!(matches.next().is_none());
+            assert!(matches.next().is_none());
+            let mut matches = table.iter_alternate_by_borrowed("enum label");
+            let (id, row) = matches.next().unwrap();
+            assert_eq!(id, b);
+            match row {
+                $row::Alternate(payload) => assert_eq!(payload.data, [4, 5, 6]),
+                _ => panic!("wrong variant"),
+            }
+            assert!(matches.next().is_none());
+            assert!(matches.next().is_none());
+            assert!(table.iter_value_by_borrowed("absent").next().is_none());
+            assert!(table.iter_alternate_by_borrowed("absent").next().is_none());
+        }};
+    }
+    check_enum!(GenericItem, GenericItemTable);
+    check_enum!(AppendGenericItem, AppendGenericItemTable);
+
     #[derive(PartialEq, Eq, Hash)]
     struct Key(u32); // Composite field keys do not need Clone.
 
@@ -245,6 +526,35 @@ macro_rules! computed_row {
 computed_row!(Computed, compute_once);
 computed_row!(AppendComputed, append_compute_once, append_only);
 
+#[derive(Debug)]
+struct ComputedPayload {
+    value: u32,
+    calls: std::rc::Rc<std::cell::Cell<usize>>,
+}
+
+fn compute_payload(payload: &ComputedPayload) -> ComputedKey {
+    payload.calls.set(payload.calls.get() + 1);
+    ComputedKey(payload.value)
+}
+
+macro_rules! computed_enum {
+    ($row:ident $(, $option:meta)*) => {
+        #[table($($option),*)]
+        #[derive(Debug)]
+        enum $row {
+            #[index(name = calculated, unique, key_type = ComputedKey, key = compute_payload)]
+            #[index(name = bucket, many, cached = true, key_type = ComputedKey, key = compute_payload)]
+            Value(ComputedPayload),
+            #[index(name = calculated, unique, key_type = ComputedKey, key = compute_payload)]
+            #[index(name = bucket, many, key_type = ComputedKey, key = compute_payload)]
+            Alternate(ComputedPayload),
+        }
+    };
+}
+
+computed_enum!(ComputedItem);
+computed_enum!(AppendComputedItem, append_only);
+
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct ComputedKey(u32);
 
@@ -256,6 +566,61 @@ impl std::borrow::Borrow<u32> for ComputedKey {
 
 #[test]
 fn computed_keys_are_cached_for_removal_and_old_replacement_keys() {
+    macro_rules! check_enum {
+        ($row:ident, $table:ident) => {{
+            let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+            let mut table = $table::new();
+            for value in 0..64 {
+                let a = table
+                    .insert($row::Value(ComputedPayload {
+                        value,
+                        calls: calls.clone(),
+                    }))
+                    .unwrap();
+                let b = table
+                    .insert($row::Alternate(ComputedPayload {
+                        value,
+                        calls: calls.clone(),
+                    }))
+                    .unwrap();
+                assert_eq!(calls.get(), 4 * (value + 1) as usize);
+                assert_eq!(table.get_value_by_calculated(&value).unwrap().0, a);
+                assert_eq!(table.get_alternate_by_calculated(&value).unwrap().0, b);
+                assert_eq!(table.iter_value_by_bucket(&value).count(), 1);
+                assert_eq!(table.iter_alternate_by_bucket(&value).count(), 1);
+                assert_eq!(calls.get(), 4 * (value + 1) as usize);
+            }
+            assert!(table.iter_value_by_bucket(&64).next().is_none());
+            assert!(table.iter_alternate_by_bucket(&64).next().is_none());
+            assert_eq!(calls.get(), 256);
+            (table, calls)
+        }};
+    }
+    let (mut items, enum_calls) = check_enum!(ComputedItem, ComputedItemTable);
+    let _ = check_enum!(AppendComputedItem, AppendComputedItemTable);
+    let id = items.get_value_by_calculated(&0).unwrap().0;
+    items
+        .replace(
+            id,
+            ComputedItem::Alternate(ComputedPayload {
+                value: 64,
+                calls: enum_calls.clone(),
+            }),
+        )
+        .unwrap();
+    assert_eq!(enum_calls.get(), 258);
+    assert!(items.get_value_by_calculated(&0).is_none());
+    assert_eq!(items.iter_value_by_bucket(&0).count(), 0);
+    assert_eq!(items.get_alternate_by_calculated(&64).unwrap().0, id);
+    assert_eq!(items.iter_alternate_by_bucket(&64).count(), 1);
+    items.remove(id);
+    let ids: Vec<_> = items.iter().map(|(id, _)| id).collect();
+    for id in ids {
+        items.remove(id);
+    }
+    assert!(items.is_empty());
+    assert_eq!(enum_calls.get(), 258);
+
     let calls = std::rc::Rc::new(std::cell::Cell::new(0));
     let mut table = ComputedTable::new();
     let id = table

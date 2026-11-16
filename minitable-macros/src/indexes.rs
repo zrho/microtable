@@ -1,5 +1,6 @@
 //! Generate row-backed and cached hash indexes.
 
+use heck::ToSnakeCase;
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
@@ -12,6 +13,53 @@ pub(super) struct Context<'a> {
     pub id: &'a syn::Type,
     pub vis: &'a syn::Visibility,
     pub append_only: bool,
+    pub variant: Option<VariantContext<'a>>,
+}
+
+pub(super) struct VariantContext<'a> {
+    pub variant: &'a syn::Ident,
+    pub payload: &'a syn::Type,
+    pub accessor: &'a syn::Ident,
+    pub accessor_mut: &'a syn::Ident,
+}
+
+impl Context<'_> {
+    fn compute(&self, ty: &syn::Type, expression: &syn::Expr, row: TokenStream) -> TokenStream {
+        let name = self.name;
+        if let Some(variant) = &self.variant {
+            let variant_name = variant.variant;
+            let payload = variant.payload;
+            quote!({
+                let __compute: fn(&#payload) -> #ty = #expression;
+                #[allow(unreachable_patterns)]
+                let __payload = match #row {
+                    #name::#variant_name(__payload) => __payload,
+                    _ => ::std::unreachable!("indexed variant"),
+                };
+                __compute(__payload)
+            })
+        } else {
+            let row_args = &self.row_args;
+            quote!({
+                let __compute: fn(&#name #row_args) -> #ty = #expression;
+                __compute(#row)
+            })
+        }
+    }
+
+    fn metadata(&self, mutable: bool) -> TokenStream {
+        self.variant
+            .as_ref()
+            .map(|variant| {
+                let accessor = if mutable {
+                    variant.accessor_mut
+                } else {
+                    variant.accessor
+                };
+                quote!(.#accessor())
+            })
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Default)]
@@ -36,12 +84,11 @@ pub(super) struct Code {
 // Bind a borrowed key from a stored row. Computed keys in non-cached indexes
 // are temporary values; field/composite keys borrow their components directly.
 fn stored_key(index: &Index, context: &Context<'_>) -> TokenStream {
-    let Context { name, row_args, .. } = context;
     let compute = match &index.key {
-        IndexKey::Computed { ty, expression } => quote! {
-            let __compute: fn(&#name #row_args) -> #ty = #expression;
-            let __computed = __compute(__stored_row);
-        },
+        IndexKey::Computed { ty, expression } => {
+            let compute = context.compute(ty, expression, quote!(__stored_row));
+            quote!(let __computed = #compute;)
+        }
         _ => quote!(),
     };
     let borrowed = index.borrowed(&quote!(__stored_row), &quote!(__computed));
@@ -61,13 +108,9 @@ impl Code {
     }
 
     fn add(&mut self, index: &Index, context: &Context<'_>) {
-        let Context {
-            runtime,
-            name,
-            row_args,
-            id,
-            ..
-        } = context;
+        let Context { runtime, id, .. } = context;
+        let metadata = context.metadata(false);
+        let metadata_mut = context.metadata(true);
         let field = &index.name;
         let ty = index.key_type();
         let map = format_ident!("__index_{}", field.unraw());
@@ -134,18 +177,14 @@ impl Code {
             });
         }
         if let IndexKey::Computed { ty, expression } = &index.key {
-            self.prepare.push(quote! {
-                let #computed: #ty = {
-                    let __compute: fn(&#name #row_args) -> #ty = #expression;
-                    __compute(&row)
-                };
-            });
+            let compute = context.compute(ty, expression, quote!(&row));
+            self.prepare.push(quote!(let #computed: #ty = #compute;));
         }
         self.prepare.push(quote! {
             let #hash = ::std::hash::BuildHasher::hash_one(&self.__hasher, #borrowed);
         });
         let old_hash = if index.cached {
-            quote!(self.__rows.get(id).expect("present row").#saved_hash)
+            quote!(self.__rows.get(id).expect("present row") #metadata .#saved_hash)
         } else {
             quote!({
                 let __rows = &self.__rows;
@@ -195,12 +234,13 @@ impl Code {
                         return ::std::result::Result::Err(#runtime::InsertError { row, kind: #runtime::InsertErrorKind::Unique { field: ::std::stringify!(#field) } });
                     }
                 });
+                let reinsert = context.variant.is_some();
                 self.checks_replace.push(quote! {
                     let #changed = match #find_new {
                         ::std::option::Option::Some(existing) if existing != id => {
                             return ::std::result::Result::Err(#runtime::ReplaceError { row, kind: #runtime::ReplaceErrorKind::Unique { field: ::std::stringify!(#field) } });
                         }
-                        ::std::option::Option::Some(_) => false,
+                        ::std::option::Option::Some(_) => #reinsert,
                         ::std::option::Option::None => true,
                     };
                 });
@@ -228,7 +268,7 @@ impl Code {
                     .push(quote!(#links: #successor.unwrap_or(id)));
                 self.groups_insert.push(quote! {
                     let #head = #find_new;
-                    let #successor = #head.map(|head| self.__rows.get(head).expect("present representative").#links);
+                    let #successor = #head.map(|head| self.__rows.get(head).expect("present representative") #metadata .#links);
                 });
                 if index.cached {
                     self.keys_insert.push(quote! {
@@ -241,7 +281,7 @@ impl Code {
                 }
                 self.commit.push(quote! {
                     if let ::std::option::Option::Some(head) = #head {
-                        self.__rows.get_mut(head).expect("present representative").#links = id;
+                        self.__rows.get_mut(head).expect("present representative") #metadata_mut .#links = id;
                     } else {
                         #insert
                     }
@@ -272,9 +312,9 @@ impl Code {
                 let detach = quote! {
                     {
                         let old = self.__rows.get(id).expect("present row");
-                        let (prev, next) = (old.#links.prev, old.#links.next);
+                        let (prev, next) = (old #metadata .#links.prev, old #metadata .#links.next);
                         if let ::std::option::Option::Some(prev) = prev {
-                            self.__rows.get_mut(prev).expect("present predecessor").#links.next = next;
+                            self.__rows.get_mut(prev).expect("present predecessor") #metadata_mut .#links.next = next;
                         } else {
                             let __old_hash = #old_hash;
                             if let ::std::option::Option::Some(next) = next {
@@ -284,7 +324,7 @@ impl Code {
                             }
                         }
                         if let ::std::option::Option::Some(next) = next {
-                            self.__rows.get_mut(next).expect("present successor").#links.prev = prev;
+                            self.__rows.get_mut(next).expect("present successor") #metadata_mut .#links.prev = prev;
                         }
                     }
                 };
@@ -326,10 +366,10 @@ impl Code {
                 self.commit.push(quote! {
                     {
                         #head
-                        self.__rows.get_mut(id).expect("present row").#links.next = head;
+                        self.__rows.get_mut(id).expect("present row") #metadata_mut .#links.next = head;
                         if let ::std::option::Option::Some(head) = head {
                             #update_new_head
-                            self.__rows.get_mut(head).expect("present head").#links.prev = ::std::option::Option::Some(id);
+                            self.__rows.get_mut(head).expect("present head") #metadata_mut .#links.prev = ::std::option::Option::Some(id);
                         } else {
                             #insert
                         }
@@ -354,6 +394,13 @@ impl Code {
             vis,
             ..
         } = context;
+        let lookup_name = index.lookup_name.unraw();
+        let suffix = if let Some(variant) = &context.variant {
+            let variant_name = variant.variant.unraw().to_string().to_snake_case();
+            format!("{variant_name}_by_{lookup_name}")
+        } else {
+            format!("by_{lookup_name}")
+        };
         let ty = index.key_type();
         let (generics, arguments, bounds, query_hash, equal) = match &index.key {
             IndexKey::Fields(fields) if fields.len() > 1 => {
@@ -408,7 +455,7 @@ impl Code {
         });
         match index.kind {
             Kind::Unique => {
-                let method = format_ident!("get_by_{}", index.name.unraw());
+                let method = format_ident!("get_{}", suffix);
                 self.lookups.push(quote! {
                     /// Find a row through a unique index, with borrowed key support.
                     #vis fn #method<#generics>(&self, #arguments) -> ::std::option::Option<(#id, &#name #row_args)>
@@ -419,8 +466,9 @@ impl Code {
                 });
             }
             Kind::Many => {
-                let method = format_ident!("iter_by_{}", index.name.unraw());
+                let method = format_ident!("iter_{}", suffix);
                 let links = format_ident!("__links_{}", index.name.unraw());
+                let metadata = context.metadata(false);
                 let initialize = if context.append_only {
                     quote!(let start = #find; let mut next = start;)
                 } else {
@@ -428,14 +476,14 @@ impl Code {
                 };
                 let advance = if context.append_only {
                     quote! {
-                        next = if ::std::option::Option::Some(entry.#links) == start {
+                        next = if ::std::option::Option::Some(entry #metadata .#links) == start {
                             ::std::option::Option::None
                         } else {
-                            ::std::option::Option::Some(entry.#links)
+                            ::std::option::Option::Some(entry #metadata .#links)
                         };
                     }
                 } else {
-                    quote!(next = entry.#links.next;)
+                    quote!(next = entry #metadata .#links.next;)
                 };
                 self.lookups.push(quote! {
                     /// Iterate over matching rows in unspecified order.

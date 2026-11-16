@@ -9,10 +9,11 @@ use quote::{format_ident, quote};
 use syn::{Fields, ItemStruct, ext::IdentExt, parse_macro_input, spanned::Spanned};
 
 mod attributes;
+mod enums;
 mod indexes;
 use attributes::{IndexMode, IndexOptions, TableOptions};
 
-/// Generate a table from a named-field struct.
+/// Generate a table from a named-field struct or singleton-tuple-variant enum.
 ///
 /// Options: `table = Name`, `index_type = u32`, and optional `id = Type` with
 /// `id_from_index = function_or_closure` and `id_to_index = function_or_closure`.
@@ -24,10 +25,16 @@ use attributes::{IndexMode, IndexOptions, TableOptions};
 /// default to non-cached storage; computed keys default to cached storage.
 #[proc_macro_attribute]
 pub fn table(args: TokenStream, input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as ItemStruct);
-    expand(args.into(), input)
-        .unwrap_or_else(syn::Error::into_compile_error)
-        .into()
+    let input = parse_macro_input!(input as syn::Item);
+    let result = match input {
+        syn::Item::Struct(row) => expand(args.into(), row),
+        syn::Item::Enum(row) => enums::expand(args.into(), row),
+        item => Err(syn::Error::new(
+            item.span(),
+            "table requires a struct or enum",
+        )),
+    };
+    result.unwrap_or_else(syn::Error::into_compile_error).into()
 }
 
 #[derive(Clone, Copy)]
@@ -46,6 +53,7 @@ enum IndexKey {
 
 struct Index {
     name: syn::Ident,
+    lookup_name: syn::Ident,
     kind: Kind,
     key: IndexKey,
     cached: bool,
@@ -154,6 +162,7 @@ fn parse_index(attr: &syn::Attribute, fields: &syn::FieldsNamed) -> syn::Result<
         .cached
         .unwrap_or(matches!(key, IndexKey::Computed { .. }));
     Ok(Index {
+        lookup_name: name.clone(),
         name,
         kind,
         key,
@@ -279,6 +288,7 @@ fn expand(args: TokenStream2, mut row: ItemStruct) -> syn::Result<TokenStream2> 
             let field_name = field.ident.clone().unwrap();
             indexes.push(Index {
                 name: field_name.clone(),
+                lookup_name: field_name.clone(),
                 kind,
                 key: IndexKey::Fields(vec![(field_name, field.ty.clone())]),
                 cached,
@@ -362,6 +372,7 @@ fn expand(args: TokenStream2, mut row: ItemStruct) -> syn::Result<TokenStream2> 
             id: &id,
             vis,
             append_only,
+            variant: None,
         },
     );
     let arena = if append_only {
@@ -672,6 +683,59 @@ mod tests {
         ] {
             let error = expand(args, syn::parse2(item).unwrap()).unwrap_err();
             assert!(error.to_string().contains(message), "{error}");
+        }
+        for item in [
+            quote!(
+                enum Row {
+                    Record { key: u32 },
+                }
+            ),
+            quote!(
+                enum Row {
+                    Unit,
+                }
+            ),
+            quote!(
+                enum Row {
+                    Empty(),
+                }
+            ),
+            quote!(
+                enum Row {
+                    Pair(u32, u32),
+                }
+            ),
+            quote!(
+                enum Row {
+                    #[index(name = key, unique, fields(key))]
+                    Value(u32),
+                }
+            ),
+            quote!(
+                enum Row {
+                    #[index(name = key, unique, key = compute)]
+                    Value(u32),
+                }
+            ),
+            quote!(
+                #[index(name = key, unique, key_type = u32, key = compute)]
+                enum Row {
+                    Value(u32),
+                }
+            ),
+            quote!(
+                enum Row {
+                    Value(#[indexed(unique)] u32),
+                }
+            ),
+            quote!(
+                enum Row {
+                    #[cfg(any())]
+                    Value(u32),
+                }
+            ),
+        ] {
+            assert!(enums::expand(quote!(), syn::parse2(item).unwrap()).is_err());
         }
     }
 }

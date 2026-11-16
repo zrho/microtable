@@ -1,4 +1,4 @@
-//! Tables generated from named-field structs by [`macro@table`].
+//! Tables generated from named-field structs or enums by [`macro@table`].
 //!
 //! ```
 //! #[minitable::table(index_type = u32)]
@@ -31,6 +31,31 @@
 //! assert_eq!(users.iter_by_normalized("ada").next().unwrap().0, id);
 //! ```
 //!
+//! # Enum tables
+//!
+//! Every variant must be a single-field tuple variant, `Variant(Payload)`.
+//! Unit variants, record variants, and tuple variants with multiple fields are
+//! rejected. Variants support only named computed indexes declared with
+//! `#[index(name = ..., unique|many, key_type = Type, key = function_or_closure,
+//! cached = ...)]`. The extractor is a function path or non-capturing closure
+//! of type `fn(&Payload) -> Key`, not a function of the enum. Computed indexes
+//! default to `cached = true`; `cached = false` is also supported. Payload
+//! indexes are not inherited. Field indexes, `fields(...)`, and enum-level
+//! index attributes are rejected.
+//!
+//! Index names must be distinct within each variant, but can be reused in
+//! different variants. Lookup methods include the snake_case variant name:
+//! for example, `get_person_by_email` or `iter_device_by_kind`. Unique lookups
+//! return `Option<(Id, &Enum)>`; many lookups iterate over `(Id, &Enum)` pairs,
+//! not payload references.
+//!
+//! All variants share one arena and ID domain. Unique constraints apply only
+//! within the indexed variant. Mutable `replace` can change a row's variant
+//! and checks constraints before changing the table. The `append_only` option
+//! also works for enums and omits `replace` and `remove`. Generated row metadata
+//! is an enum that stores index links and cached hashes only for the active
+//! variant, not for every variant.
+//!
 //! # Append-only tables
 //!
 //! `#[minitable::table(append_only)]` generates an append-only table. It supports
@@ -56,7 +81,8 @@
 //! Noncached field and composite components require `Eq + Hash`, not `Clone`.
 //! Cached components require `Clone + Eq + Hash`. A computed index declares
 //! `key_type` and a `key` function path or non-capturing closure of type
-//! `fn(&Row) -> Key`. Its result requires only `Eq + Hash`, even when cached:
+//! `fn(&Row) -> Key` for structs or `fn(&Payload) -> Key` for enum variants.
+//! Its result requires only `Eq + Hash`, even when cached:
 //! the result is moved into the map. Source fields need no additional bounds.
 //!
 //! Cached computed keys are evaluated once per attempted write that reaches

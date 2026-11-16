@@ -1,7 +1,7 @@
 # minitable
 
 A Rust library that generates tables with stable row IDs and hash-based
-field indexes. The workspace contains `minitable` (runtime storage and errors)
+indexes. The workspace contains `minitable` (runtime storage and errors)
 and `minitable-macros` (the attribute macro, re-exported by `minitable`).
 
 ```rust
@@ -42,8 +42,8 @@ people.remove(id).unwrap();
 assert!(people.get(id).is_none());
 ```
 
-The macro preserves the original struct and its ordinary attributes. It generates
-`PersonTable` with the struct's visibility. Rows can have lifetimes,
+The macro preserves the original row type and its ordinary attributes. It generates
+`PersonTable` with the row type's visibility. Rows can have lifetimes,
 type parameters, const parameters, and where clauses.
 
 Configure the table and use a custom ID type with:
@@ -64,7 +64,7 @@ struct Person {
 }
 ```
 
-The table name defaults to `<Struct>Table`, and `index_type` defaults to `usize`.
+The table name defaults to `<Row>Table`, and `index_type` defaults to `usize`.
 Row IDs use `index_type` directly unless a custom `id` type is specified.
 A custom ID requires both `id_from_index: fn(Index) -> Id` and
 `id_to_index: fn(Id) -> Index`. Each callback accepts a function path, such as
@@ -107,9 +107,58 @@ index stores one plain ID successor per row in a circular group, with a stable
 representative row ID. There are no per-row cached hashes. Group iteration
 visits each matching row once; all iteration order is unspecified.
 
+## Enum tables
+
+Every enum variant must be a single-field tuple variant, `Variant(Payload)`.
+Unit variants, record variants, and tuple variants with multiple fields are rejected.
+
+```rust
+#[derive(Debug)]
+struct Person { email: String }
+#[derive(Debug)]
+struct Device { kind: String }
+
+#[minitable::table]
+#[derive(Debug)]
+enum Entry {
+    #[index(name = email, unique, key_type = String,
+            key = |person| person.email.clone())]
+    Person(Person),
+    #[index(name = kind, many, key_type = String,
+            key = |device| device.kind.clone(), cached = false)]
+    Device(Device),
+}
+
+let mut entries = EntryTable::new();
+let id = entries.insert(Entry::Person(Person { email: "ada@example.com".into() })).unwrap();
+entries.insert(Entry::Device(Device { kind: "sensor".into() })).unwrap();
+assert_eq!(entries.get_person_by_email("ada@example.com").unwrap().0, id);
+assert_eq!(entries.iter_device_by_kind("sensor").count(), 1);
+```
+
+Only named computed `#[index(name = ..., unique|many, key_type = Type,
+key = function_or_closure, cached = ...)]` indexes are supported on variants.
+The extractor is a function path or non-capturing closure of type
+`fn(&Payload) -> Key`, not a function of the enum. Computed indexes default to
+`cached = true`; `cached = false` is also supported. Payload indexes are not
+inherited. Field indexes, `fields(...)`, and enum-level index attributes are
+rejected.
+
+Index names must be distinct within a variant, but different variants can use
+the same name. Lookup methods include the snake_case variant name, such as
+`get_person_by_email` and `iter_device_by_kind`. They return `(Id, &Entry)`
+pairs through an `Option` or iterator, as in struct tables, not payload references.
+All variants share one arena and ID domain. Unique constraints apply only within
+the indexed variant. In mutable tables, `replace` can change a row's variant;
+constraints are checked before the table changes. `append_only` also works for
+enum tables and omits `replace` and `remove`.
+
+Generated row metadata is an enum: it stores index links and cached hashes only
+for the active variant, not for every variant.
+
 ## Named indexes
 
-Declare named indexes on the struct to combine fields or compute keys:
+Declare named indexes on a struct to combine fields or compute keys:
 
 ```rust
 #[minitable::table]
@@ -136,7 +185,7 @@ assert_eq!(accounts.get_by_normalized_email("1:ada@example.com").unwrap().0, id)
 ```
 
 Named indexes support both `unique` and `many`, and coexist with field attributes.
-Names must be distinct from every other index name, including field indexes.
+For structs, names must be distinct from every other index name, including field indexes.
 `fields(...)` accepts one or more distinct field names. Composite lookups take
 one borrowed argument per field, in the declared order.
 
@@ -198,7 +247,8 @@ hash/equality behavior while stored, including through interior mutability.
 User-defined hashing, equality, and cloning should not panic; table consistency
 after a panic in those operations is not guaranteed.
 
-The API supports named-field structs with field, composite, and computed indexes.
+The API supports named-field structs with field, composite, and computed indexes,
+and single-field tuple enum variants with named computed indexes.
 Conditionally compiled fields are rejected. Serialization and mutable row
 references are outside the current API.
 
