@@ -153,8 +153,8 @@ pub(super) fn expand(args: TokenStream2, mut row: syn::ItemEnum) -> syn::Result<
         variant.attrs = retained;
         all_indexes.push(variant_indexes);
     }
-    let runtime = match proc_macro_crate::crate_name("minitable") {
-        Ok(proc_macro_crate::FoundCrate::Itself) => quote!(::minitable),
+    let runtime = match proc_macro_crate::crate_name("microtable") {
+        Ok(proc_macro_crate::FoundCrate::Itself) => quote!(::microtable),
         Ok(proc_macro_crate::FoundCrate::Name(name)) => {
             let ident = format_ident!("{}", name);
             quote!(::#ident)

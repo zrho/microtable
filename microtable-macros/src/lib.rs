@@ -1,4 +1,4 @@
-//! Attribute expansion for `minitable`.
+//! Attribute expansion for `microtable`.
 #![forbid(unsafe_code)]
 
 use std::collections::HashSet;
@@ -310,8 +310,8 @@ fn expand(args: TokenStream2, mut row: ItemStruct) -> syn::Result<TokenStream2> 
             return Err(syn::Error::new(index.name.span(), "duplicate index name"));
         }
     }
-    let runtime = match proc_macro_crate::crate_name("minitable") {
-        Ok(proc_macro_crate::FoundCrate::Itself) => quote!(::minitable),
+    let runtime = match proc_macro_crate::crate_name("microtable") {
+        Ok(proc_macro_crate::FoundCrate::Itself) => quote!(::microtable),
         Ok(proc_macro_crate::FoundCrate::Name(name)) => {
             let ident = format_ident!("{}", name);
             quote!(::#ident)

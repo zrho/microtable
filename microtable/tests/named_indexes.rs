@@ -1,4 +1,4 @@
-use minitable::{InsertErrorKind, ReplaceErrorKind, table};
+use microtable::{InsertErrorKind, ReplaceErrorKind, table};
 
 macro_rules! member_row {
     ($row:ident, $table:ident, $make:ident, $group:ident $(, $option:meta)*) => {

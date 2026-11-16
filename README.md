@@ -1,11 +1,11 @@
-# minitable
+# microtable
 
 A Rust library that generates tables with stable row IDs and hash-based
-indexes. The workspace contains `minitable` (runtime storage and errors)
-and `minitable-macros` (the attribute macro, re-exported by `minitable`).
+indexes. The workspace contains `microtable` (runtime storage and errors)
+and `microtable-macros` (the attribute macro, re-exported by `microtable`).
 
 ```rust
-#[minitable::table(index_type = u32)]
+#[microtable::table(index_type = u32)]
 #[derive(Debug)]
 pub struct Person {
     #[indexed(unique)]
@@ -52,7 +52,7 @@ Configure the table and use a custom ID type with:
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct PersonKey(u16);
 
-#[minitable::table(
+#[microtable::table(
     table = People,
     id = PersonKey,
     index_type = u16,
@@ -96,7 +96,7 @@ is immutable; change rows through `replace` in mutable tables.
 
 ## Append-only tables
 
-Use `#[minitable::table(append_only)]` or `append_only = true` when rows must
+Use `#[microtable::table(append_only)]` or `append_only = true` when rows must
 not be removed or replaced. These tables retain `insert`, read methods, full
 and indexed iteration, `new`, `default`, `len`, and `is_empty`; `remove` and
 `replace` are not generated. Index cache options and defaults, custom IDs, and
@@ -118,7 +118,7 @@ struct Person { email: String }
 #[derive(Debug)]
 struct Device { kind: String }
 
-#[minitable::table]
+#[microtable::table]
 #[derive(Debug)]
 enum Entry {
     #[index(name = email, unique, key_type = String,
@@ -161,7 +161,7 @@ for the active variant, not for every variant.
 Declare named indexes on a struct to combine fields or compute keys:
 
 ```rust
-#[minitable::table]
+#[microtable::table]
 #[index(name = tenant_email, unique, fields(tenant, email))]
 #[index(name = tenant_team, many, fields(tenant, team))]
 #[index(name = normalized_email, unique, key_type = String,
@@ -256,7 +256,7 @@ Run the checks with `cargo test --workspace`, `cargo fmt --all --check`, and
 `cargo clippy --workspace --all-targets -- -D warnings`.
 
 The arena tests also pass with
-`MIRIFLAGS=-Zmiri-tree-borrows cargo +nightly miri test -p minitable --lib`.
+`MIRIFLAGS=-Zmiri-tree-borrows cargo +nightly miri test -p microtable --lib`.
 With `bitvec` 1.1.1, default Miri reports a Stacked Borrows violation inside
 `BitVec::push`, independently reproducible without an arena. Tree Borrows passes
 the arena tests, but `bitvec` still emits an integer-to-pointer provenance

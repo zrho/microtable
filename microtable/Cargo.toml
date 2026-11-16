@@ -1,5 +1,5 @@
 [package]
-name = "minitable"
+name = "microtable"
 version = "0.1.0"
 edition = "2024"
 description = "Generated tables with stable row IDs and field indexes"
@@ -8,4 +8,4 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 bitvec = { version = "1.1", default-features = false, features = ["alloc"] }
 hashbrown = "0.17"
-minitable-macros = { path = "../minitable-macros", version = "0.1.0" }
+microtable-macros = { path = "../microtable-macros", version = "0.1.0" }

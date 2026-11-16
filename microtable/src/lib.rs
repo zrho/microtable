@@ -1,7 +1,7 @@
 //! Tables generated from named-field structs or enums by [`macro@table`].
 //!
 //! ```
-//! #[minitable::table(index_type = u32)]
+//! #[microtable::table(index_type = u32)]
 //! #[derive(Debug)]
 //! struct Person {
 //!     #[indexed(unique)]
@@ -20,7 +20,7 @@
 //! Named indexes can combine fields or compute a key:
 //!
 //! ```
-//! #[minitable::table]
+//! #[microtable::table]
 //! #[index(name = tenant_name, unique, fields(tenant, name))]
 //! #[index(name = normalized, many, key_type = String, key = |row| row.name.to_ascii_lowercase())]
 //! #[derive(Debug)]
@@ -58,7 +58,7 @@
 //!
 //! # Append-only tables
 //!
-//! `#[minitable::table(append_only)]` generates an append-only table. It supports
+//! `#[microtable::table(append_only)]` generates an append-only table. It supports
 //! insertion and immutable access, but does not generate `remove` or `replace`.
 //! `append_only = false` is the default. Cache options and ID conversions work
 //! in both modes.
@@ -105,7 +105,7 @@
 
 mod arena;
 
-pub use minitable_macros::table;
+pub use microtable_macros::table;
 
 /// Why an insertion failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

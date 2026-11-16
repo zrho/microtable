@@ -1,4 +1,4 @@
-use minitable::{InsertErrorKind, ReplaceErrorKind, table};
+use microtable::{InsertErrorKind, ReplaceErrorKind, table};
 
 #[table]
 #[derive(Debug, PartialEq, Eq)]
