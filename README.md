@@ -38,6 +38,7 @@ let id = people.insert(Person {
     team: "engineering".into(),
 }).unwrap();
 
+assert_eq!(people[id].name, "Ada");
 assert_eq!(people.get_by_email("ada@example.com").unwrap().0, id);
 for (_, person) in people.iter_by_team("engineering") {
     println!("{}", person.name);
@@ -48,7 +49,8 @@ for (_, person) in people.iter_by_team("engineering") {
 generates `iter_by_<name>`, returning an iterator of `(Id, &Row)`.
 Indexes are noncached by default and can borrow directly from the row.
 
-Rows are immutable through the table. Use `replace` to update all indexes while
+`table[id]` returns an immutable row reference and panics if the ID is absent.
+Use `get(id)` for optional access. Use `replace` to update all indexes while
 keeping the ID:
 
 ```rust

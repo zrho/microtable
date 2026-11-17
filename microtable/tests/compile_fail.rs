@@ -29,7 +29,7 @@ fn rejected_apis_fail_in_an_external_offline_consumer() {
             "valid control",
             true,
             r#"
-            #[derive(Debug)] struct Row { key: String }
+            #[derive(Debug)] pub struct Row { key: String }
             microtable::table! {
                 pub struct Rows([Row]);
                 #[id] pub struct RowId(u8);
@@ -39,6 +39,7 @@ fn rejected_apis_fail_in_an_external_offline_consumer() {
                 let mut rows = Rows::new();
                 let id = rows.insert(Row { key: "a".into() }).unwrap();
                 assert_eq!(id.index(), 0);
+                let _: &Row = &rows[id];
                 assert!(rows.get_by_key("a").is_some());
             }
         "#,

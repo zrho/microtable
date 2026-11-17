@@ -724,6 +724,13 @@ fn expand(declaration: Declaration) -> syn::Result<Tokens> {
     Ok(quote! {
         #id_def #entry_def #table_def #debug_impl
         #(#iterators)*
+        #(#cfg)* impl #ig ::std::ops::Index<#id> for #name #args #wc {
+            type Output = #row;
+
+            fn index(&self, id: #id) -> &Self::Output {
+                self.get(id).expect("row ID is not present in this table")
+            }
+        }
         #(#cfg)* impl #ig ::std::default::Default for #name #args #wc {
             fn default() -> Self {
                 let __hasher: #hasher = ::std::default::Default::default();
