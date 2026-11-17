@@ -627,9 +627,17 @@ fn expand(declaration: Declaration) -> syn::Result<Tokens> {
     let mut generics = table.generics.clone();
     generics.make_where_clause().predicates.push(syn::parse_quote!(#hasher: ::std::hash::BuildHasher + ::std::clone::Clone + ::std::default::Default));
     for index in &indexes {
-        // Borrowed outputs are local values, never fields. Bound their referents
-        // rather than adding a higher-ranked bound that would require Row: 'static.
-        indexes::add_key_bounds(&mut generics, &index.key);
+        if index.dense {
+            let key = &index.key;
+            generics
+                .make_where_clause()
+                .predicates
+                .push(syn::parse_quote!(#key: ::std::marker::Copy + ::std::convert::Into<usize>));
+        } else {
+            // Borrowed outputs are local values, never fields. Bound their referents
+            // rather than adding a higher-ranked bound that would require Row: 'static.
+            indexes::add_key_bounds(&mut generics, &index.key);
+        }
     }
     let (ig, args, wc) = generics.split_for_impl();
     let entry = format_ident!("__{}Entry", name.unraw());

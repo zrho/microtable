@@ -104,9 +104,16 @@ needed to clone a cached table. Tuple lookups take one tuple reference.
 For small integer domains, `dense` uses a `Vec<Option<Id>>` instead of hashing:
 
 ```rust
+#[derive(Clone, Copy)]
+struct WorkerNumber(u16);
+
+impl From<WorkerNumber> for usize {
+    fn from(worker: WorkerNumber) -> usize { usize::from(worker.0) }
+}
+
 struct Session {
     slot: usize,
-    worker: Option<usize>,
+    worker: Option<WorkerNumber>,
 }
 
 microtable::table! {
@@ -116,14 +123,18 @@ microtable::table! {
     fn slot(session: &Session) -> usize { session.slot }
 
     #[index(many, dense, optional)]
-    fn worker(session: &Session) -> Option<usize> { session.worker }
+    fn worker(session: &Session) -> Option<WorkerNumber> { session.worker }
 }
 ```
 
-Look up rows with `sessions.get_by_slot(&3)` or
-`sessions.iter_by_worker(&7)`. Keys must be `usize`, or `Option<usize>` with
-`optional`. Out-of-range lookups return no matches. Dense indexes cannot be
-`cached`.
+Look up rows with `sessions.get_by_slot(3)` or
+`sessions.iter_by_worker(WorkerNumber(7))`. Dense lookups take the extractor's
+exact key type by value. Keys require `Copy + Into<usize>`, not `Eq + Hash`;
+`optional` extractors return `Option<Key>` but lookups take `Key`.
+
+The converted integer determines uniqueness and group membership. Conversions
+must be deterministic. Out-of-range lookups return no matches. Dense indexes
+cannot be `cached`.
 
 The vector grows to include the highest key and does not shrink on removal.
 Memory therefore depends on the highest key, not the row count: use closely

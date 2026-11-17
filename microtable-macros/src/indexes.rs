@@ -217,7 +217,7 @@ pub(super) fn generate(indexes: &[Index], context: &Context<'_>) -> Code {
                 .push(quote!(#map: ::std::vec::Vec<::std::option::Option<#id>>));
             code.map_defaults.push(quote!(#map: ::std::vec::Vec::new()));
             code.prepare.push(
-                quote!(let #key: ::std::option::Option<usize> = #incoming; let #hash = #key;),
+                quote!(let #key: ::std::option::Option<#ty> = #incoming; let #hash = #key.map(::std::convert::Into::<usize>::into);),
             );
             code.checks_capacity.push(quote! {
                 let #needed = #hash.map(|position| {
@@ -251,7 +251,7 @@ pub(super) fn generate(indexes: &[Index], context: &Context<'_>) -> Code {
         // Only mutable cached indexes need stored hashes. Noncached indexes
         // derive membership and the old hash from the live row.
         let old_hash = if index.dense {
-            current.clone()
+            quote!(#current.map(::std::convert::Into::<usize>::into))
         } else if index.cached {
             if !append_only {
                 code.entry_fields
@@ -390,7 +390,7 @@ fn lookup(
     let (query_generics, parameter, bounds, equal, _captures) = if index.dense {
         (
             quote!(),
-            quote!(value: &usize),
+            quote!(value: #key_type),
             quote!(),
             quote!(),
             quote!(),
@@ -482,7 +482,7 @@ fn lookup(
         quote!(self.#map.find(__hash, |__candidate| { #stored.is_some_and(|__stored_key| { let __stored_key = &__stored_key; #equal }) }).copied())
     };
     let search = if index.dense {
-        quote!(let head = self.#map.get(*value).copied().flatten();)
+        quote!(let position = ::std::convert::Into::<usize>::into(value); let head = self.#map.get(position).copied().flatten();)
     } else {
         quote!(let __hash = ::std::hash::BuildHasher::hash_one(&self.__hasher, value); let head = #find;)
     };
