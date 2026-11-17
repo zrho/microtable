@@ -7,7 +7,7 @@ use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
 use syn::{ext::IdentExt, spanned::Spanned, visit_mut::VisitMut};
 
-use super::{Index, IndexKey, attributes, indexes};
+use super::{Index, IndexKey, attributes, indexes, traits};
 
 pub(super) fn expand(args: TokenStream2, mut row: syn::ItemEnum) -> syn::Result<TokenStream2> {
     let name = row.ident.clone();
@@ -192,6 +192,8 @@ pub(super) fn expand(args: TokenStream2, mut row: syn::ItemEnum) -> syn::Result<
     } else {
         quote!(let id = self.__rows.insert(entry);)
     };
+    let clone_enabled = traits::enabled(&row.attrs, "Clone")?;
+    let debug_enabled = traits::enabled(&row.attrs, "Debug")?;
     let mut metadata_structs = Vec::new();
     let mut metadata_variants = Vec::new();
     let mut accessors = Vec::new();
@@ -253,13 +255,16 @@ pub(super) fn expand(args: TokenStream2, mut row: syn::ItemEnum) -> syn::Result<
         map_fields.extend(fields);
         map_defaults.extend(defaults);
         lookups.extend(methods);
-        metadata_structs.push(quote! {
-            #(#cfg)*
-            struct #meta_struct #original_generics #row_where {
-                #(#entry_fields,)*
-                __marker: ::std::marker::PhantomData<fn() -> #name #row_args>,
-            }
-        });
+        metadata_structs.push(traits::with_clone(
+            quote! {
+                #(#cfg)*
+                struct #meta_struct #original_generics #row_where {
+                    #(#entry_fields,)*
+                    __marker: ::std::marker::PhantomData<fn() -> #name #row_args>,
+                }
+            },
+            &clone_enabled,
+        ));
         metadata_variants.push(quote!(#meta_variant(#meta_struct #row_args)));
         accessors.push(quote! {
             fn #accessor(&self) -> &#meta_struct #row_args {
@@ -338,32 +343,55 @@ pub(super) fn expand(args: TokenStream2, mut row: syn::ItemEnum) -> syn::Result<
             self.__rows.remove(id).map(|entry| entry.row)
         }
     });
+    let metadata_definition = traits::with_clone(
+        quote! {
+            #(#cfg)*
+            enum #metadata #original_generics #row_where {
+                #(#metadata_variants,)*
+            }
+        },
+        &clone_enabled,
+    );
+    let entry_definition = traits::with_clone(
+        quote! {
+            #(#cfg)*
+            struct #entry #original_generics #row_where {
+                row: #name #row_args,
+                metadata: #metadata #row_args,
+            }
+        },
+        &clone_enabled,
+    );
+    let table_definition = traits::with_clone(
+        quote! {
+            #(#cfg)*
+            #vis struct #table #table_generics #table_where {
+                __rows: #arena<#entry #row_args, #id>,
+                __hasher: #hasher,
+                #(#map_fields,)*
+            }
+        },
+        &clone_enabled,
+    );
+    let debug_impl = traits::debug_impl(
+        &table,
+        &table_generics,
+        quote!(#name #row_args),
+        &id,
+        &cfg,
+        &debug_enabled,
+    );
     Ok(quote! {
         #row
-
         #(#metadata_structs)*
-
-        #(#cfg)*
-        enum #metadata #original_generics #row_where {
-            #(#metadata_variants,)*
-        }
-
-        #(#cfg)*
-        struct #entry #original_generics #row_where {
-            row: #name #row_args,
-            metadata: #metadata #row_args,
-        }
+        #metadata_definition
+        #entry_definition
+        #table_definition
+        #debug_impl
 
         #(#cfg)*
         impl #row_impl #entry #row_args #row_where {
             #(#accessors)*
-        }
-
-        #(#cfg)*
-        #vis struct #table #table_generics #table_where {
-            __rows: #arena<#entry #row_args, #id>,
-            __hasher: #hasher,
-            #(#map_fields,)*
         }
 
         #(#cfg)*

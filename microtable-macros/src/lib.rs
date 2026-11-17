@@ -11,6 +11,7 @@ use syn::{Fields, ItemStruct, ext::IdentExt, parse_macro_input, spanned::Spanned
 mod attributes;
 mod enums;
 mod indexes;
+mod traits;
 use attributes::{IndexMode, IndexOptions, TableOptions};
 
 /// Generate a table from a named-field struct or singleton-tuple-variant enum.
@@ -26,6 +27,8 @@ use attributes::{IndexMode, IndexOptions, TableOptions};
 /// `#[index(name = derived, many, key_type = String, key = compute_key)]`.
 /// Both index forms accept `cached` or `cached = false`. Field/composite keys
 /// default to non-cached storage; computed keys default to cached storage.
+/// Tables copy `Debug` and `Clone` from the row's derive attributes. `Debug`
+/// displays IDs and rows. `Clone` also requires stored index keys to be cloneable.
 #[proc_macro_attribute]
 pub fn table(args: TokenStream, input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as syn::Item);
@@ -418,22 +421,43 @@ fn expand(args: TokenStream2, mut row: ItemStruct) -> syn::Result<TokenStream2> 
     } else {
         "Get a row by ID. Removed IDs can refer to rows inserted into reused slots."
     };
+    let clone_enabled = traits::enabled(&row.attrs, "Clone")?;
+    let debug_enabled = traits::enabled(&row.attrs, "Debug")?;
+    let entry_definition = traits::with_clone(
+        quote! {
+            #(#cfg)*
+            struct #entry #original_generics #row_where {
+                row: #name #row_args,
+                #(#entry_fields,)*
+            }
+        },
+        &clone_enabled,
+    );
+    let table_definition = traits::with_clone(
+        quote! {
+            #(#cfg)*
+            #[doc = #table_doc]
+            #vis struct #table #table_generics #table_where {
+                __rows: #arena<#entry #row_args, #id>,
+                __hasher: #hasher,
+                #(#map_fields,)*
+            }
+        },
+        &clone_enabled,
+    );
+    let debug_impl = traits::debug_impl(
+        &table,
+        &table_generics,
+        quote!(#name #row_args),
+        &id,
+        &cfg,
+        &debug_enabled,
+    );
     Ok(quote! {
         #row
-
-        #(#cfg)*
-        struct #entry #original_generics #row_where {
-            row: #name #row_args,
-            #(#entry_fields,)*
-        }
-
-        #(#cfg)*
-        #[doc = #table_doc]
-        #vis struct #table #table_generics #table_where {
-            __rows: #arena<#entry #row_args, #id>,
-            __hasher: #hasher,
-            #(#map_fields,)*
-        }
+        #entry_definition
+        #table_definition
+        #debug_impl
 
         #(#cfg)*
         impl #impl_generics ::std::default::Default for #table #type_generics #table_where {

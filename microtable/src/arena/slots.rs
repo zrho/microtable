@@ -25,6 +25,34 @@ pub(super) struct Slots<T> {
     len: usize,
 }
 
+impl<T: Clone> Clone for Slots<T> {
+    fn clone(&self) -> Self {
+        let mut cloned = Self {
+            slots: Vec::with_capacity(self.slots.len()),
+            occupied: self.occupied.clone(),
+            free: self.free,
+            len: self.len,
+        };
+        for (index, slot) in self.slots.iter().enumerate() {
+            let slot = if self.occupied[index] {
+                // SAFETY: The occupancy bit proves value is initialized.
+                Slot {
+                    value: ManuallyDrop::new(unsafe { &*slot.value }.clone()),
+                }
+            } else {
+                // SAFETY: Vacant slots contain initialized free-list links.
+                Slot {
+                    next_free: unsafe { slot.next_free },
+                }
+            };
+            // Capacity is reserved. If cloning panics, Drop visits only the
+            // slots already pushed, whose occupancy bits match the source.
+            cloned.slots.push(slot);
+        }
+        cloned
+    }
+}
+
 impl<T> Default for Slots<T> {
     fn default() -> Self {
         Self {

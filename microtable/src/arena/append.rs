@@ -6,6 +6,16 @@ pub struct AppendArena<T, Id> {
     to_index: fn(Id) -> usize,
 }
 
+impl<T: Clone, Id> Clone for AppendArena<T, Id> {
+    fn clone(&self) -> Self {
+        Self {
+            values: self.values.clone(),
+            from_index: self.from_index,
+            to_index: self.to_index,
+        }
+    }
+}
+
 impl<T, Id: Copy> AppendArena<T, Id> {
     pub fn new(from_index: fn(usize) -> Id, to_index: fn(Id) -> usize) -> Self {
         Self {

@@ -17,6 +17,16 @@ pub struct Arena<T, Id> {
     to_index: fn(Id) -> usize,
 }
 
+impl<T: Clone, Id> Clone for Arena<T, Id> {
+    fn clone(&self) -> Self {
+        Self {
+            slots: self.slots.clone(),
+            from_index: self.from_index,
+            to_index: self.to_index,
+        }
+    }
+}
+
 impl<T, Id: Copy> Arena<T, Id> {
     pub fn new(from_index: fn(usize) -> Id, to_index: fn(Id) -> usize) -> Self {
         Self {
