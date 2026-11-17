@@ -72,6 +72,11 @@ impl<T, Id: ArenaId> Arena<T, Id> {
         self.slots.can_insert()
     }
 
+    pub fn reserve(&mut self, additional: usize) {
+        check_id_capacity::<Id>(self.slots.reservation_len(additional));
+        self.slots.reserve(additional);
+    }
+
     pub fn insert(&mut self, value: T) -> Id {
         assert!(self.can_insert(), "table capacity exhausted");
         let id = self.next_id();
@@ -103,8 +108,19 @@ fn vec_can_grow<T>(len: usize) -> bool {
     let Some(next_len) = len.checked_add(1) else {
         return false;
     };
+    vec_can_hold::<T>(next_len)
+}
+
+fn vec_can_hold<T>(len: usize) -> bool {
     let size = std::mem::size_of::<T>();
-    size == 0 || next_len <= isize::MAX as usize / size
+    size == 0 || len <= isize::MAX as usize / size
+}
+
+// Validate the highest required slot without allocating or consuming an ID.
+fn check_id_capacity<Id: ArenaId>(len: usize) {
+    if let Some(index) = len.checked_sub(1) {
+        let _ = Id::from_index(index);
+    }
 }
 
 #[cfg(test)]

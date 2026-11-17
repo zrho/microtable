@@ -16,6 +16,7 @@ pub(super) struct Code {
     pub checks_replace: Vec<Tokens>,
     pub checks_capacity: Vec<Tokens>,
     pub reserve: Vec<Tokens>,
+    pub reserve_additional: Vec<Tokens>,
     pub detach: Vec<Tokens>,
     pub commit: Vec<Tokens>,
     pub lookups: Vec<Tokens>,
@@ -239,6 +240,8 @@ pub(super) fn generate(indexes: &[Index], context: &Context<'_>) -> Code {
             code.map_fields.push(quote!(#map: #runtime::__private::HashMap<#runtime::__private::CachedKey<#ty, #id>, (), #hasher>));
             code.map_defaults.push(quote!(#map: #runtime::__private::HashMap::with_hasher(::std::clone::Clone::clone(&__hasher))));
             code.reserve.push(quote!(self.#map.reserve(1);));
+            code.reserve_additional
+                .push(quote!(self.#map.reserve(additional);));
             code.prepare.push(quote!(let #key = #incoming; let #hash = #key.as_ref().map(|key| ::std::hash::BuildHasher::hash_one(&self.__hasher, key));));
         } else {
             code.map_fields
@@ -246,6 +249,17 @@ pub(super) fn generate(indexes: &[Index], context: &Context<'_>) -> Code {
             code.map_defaults
                 .push(quote!(#map: #runtime::__private::HashTable::new()));
             code.reserve.push(quote!({ let __rows = &self.__rows; let __hasher = &self.__hasher; self.#map.reserve(1, #rehash); }));
+            // Hashbrown can discard entries if an in-place rehash panics. Stage
+            // reservation on a copy so extractor failure leaves membership intact.
+            code.reserve_additional.push(quote! {
+                if additional > self.#map.capacity() - self.#map.len() {
+                    let __rows = &self.__rows;
+                    let __hasher = &self.__hasher;
+                    let mut __reserved = self.#map.clone();
+                    __reserved.reserve(additional, #rehash);
+                    self.#map = __reserved;
+                }
+            });
             code.prepare.push(quote!(let #key = #incoming; let #hash = #key.as_ref().map(|key| ::std::hash::BuildHasher::hash_one(&self.__hasher, key));));
         }
         // Only mutable cached indexes need stored hashes. Noncached indexes

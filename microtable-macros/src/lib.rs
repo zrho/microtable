@@ -672,6 +672,7 @@ fn expand(declaration: Declaration) -> syn::Result<Tokens> {
         checks_replace,
         checks_capacity,
         reserve,
+        reserve_additional,
         detach,
         commit,
         lookups,
@@ -765,6 +766,29 @@ fn expand(declaration: Declaration) -> syn::Result<Tokens> {
         }
         #(#cfg)* impl #ig #name #args #wc {
             #vis fn new() -> Self { ::std::default::Default::default() }
+            /// Creates an empty table with space for at least `capacity` rows and hash-index entries.
+            /// Dense indexes still grow with their keys. See `reserve` for limits and panic behavior.
+            #vis fn with_capacity(capacity: usize) -> Self {
+                let mut table = Self::new();
+                table.reserve(capacity);
+                table
+            }
+            /// Reserves space for `additional` rows beyond the current live count.
+            /// Vacant row slots are reused. Each hash index reserves for the worst case:
+            /// every additional row introduces a distinct key. Dense indexes are unchanged
+            /// and can still allocate when a larger key is inserted.
+            ///
+            /// Rows, IDs, and index contents do not change. Noncached hash indexes can
+            /// rerun extractors during rehashing. If an extractor panics, logical contents
+            /// remain unchanged, but some allocations may have grown.
+            ///
+            /// # Panics
+            /// Panics if the request exceeds structural or ID limits, or an extractor
+            /// panics. Allocation failure follows the backing collections' behavior.
+            #vis fn reserve(&mut self, additional: usize) {
+                self.__rows.reserve(additional);
+                #(#reserve_additional)*
+            }
             #vis fn len(&self) -> usize { self.__rows.len() }
             #vis fn is_empty(&self) -> bool { self.len() == 0 }
             #vis fn next_id(&self) -> #id {

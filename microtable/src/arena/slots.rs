@@ -89,6 +89,26 @@ impl<T> Slots<T> {
         Self::can_insert_at(self.slots.len(), self.len, self.free.is_some())
     }
 
+    // Vacant slots already have storage and are reused before extending the vectors.
+    pub fn reservation_len(&self, additional: usize) -> usize {
+        let required = self
+            .len
+            .checked_add(additional)
+            .expect("table capacity exhausted")
+            .max(self.slots.len());
+        assert!(
+            super::vec_can_hold::<Slot<T>>(required) && required <= BitSlice::<usize>::MAX_BITS,
+            "table capacity exhausted"
+        );
+        required
+    }
+
+    pub fn reserve(&mut self, additional: usize) {
+        let growth = self.reservation_len(additional) - self.slots.len();
+        self.slots.reserve(growth);
+        self.occupied.reserve(growth);
+    }
+
     pub fn insert(&mut self, value: T) -> usize {
         assert!(self.can_insert(), "table capacity exhausted");
         let index = self.next_index();

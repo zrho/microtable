@@ -69,6 +69,23 @@ Tables also provide `default`, `len`, `is_empty`, `contains`, and `iter`.
 `next_id` previews the next insertion ID without reserving it. Iteration order is
 unspecified.
 
+### Reserve capacity
+
+Use `People::with_capacity(capacity)` to create an empty table with reserved
+storage, or `people.reserve(additional)` to reserve for more rows beyond the
+current live count. Both mutable and append-only tables support these methods.
+Vacant row slots count toward the reservation. Each hash index reserves enough
+space for every additional row to introduce a distinct key.
+
+Reservation does not change rows, IDs, index contents, or free-list order.
+Dense indexes are unchanged: their storage depends on the highest key, so
+inserting a larger dense key can still allocate. Reservation can rerun
+noncached index extractors during rehashing. If an extractor panics, logical
+contents remain unchanged, but some allocations may have grown.
+
+Requests beyond structural or ID limits panic. Allocation failure follows the
+backing collections' behavior.
+
 ## Computed and composite keys
 
 A different table can index the same row type differently:

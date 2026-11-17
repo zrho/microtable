@@ -49,6 +49,16 @@ impl<T, Id: ArenaId> AppendArena<T, Id> {
     }
 
     pub fn reserve(&mut self, additional: usize) {
+        let required = self
+            .values
+            .len()
+            .checked_add(additional)
+            .expect("table capacity exhausted");
+        assert!(
+            super::vec_can_hold::<T>(required),
+            "table capacity exhausted"
+        );
+        super::check_id_capacity::<Id>(required);
         self.values.reserve(additional);
     }
 
