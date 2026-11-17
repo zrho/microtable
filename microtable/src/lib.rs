@@ -56,6 +56,11 @@
 //! is an enum that stores index links and cached hashes only for the active
 //! variant, not for every variant.
 //!
+//! `next_id()` returns the ID of the next successful insertion without reserving
+//! it or changing the table. Rejected insertions do not consume it; removals can
+//! change it through slot reuse. It works in all table modes and panics if row
+//! storage capacity is exhausted.
+//!
 //! # Insertion and replacement failures
 //!
 //! `insert(row)` returns `Result<Id, (Row, Id)>`: `Ok` contains the new ID, and

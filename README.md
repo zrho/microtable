@@ -79,6 +79,7 @@ Generated tables provide:
 | --- | --- |
 | `new()`, `default()` | Empty table |
 | `len()`, `is_empty()` | Live row count |
+| `next_id()` | ID of the next successful insertion, without reserving it |
 | `insert(row)` | `Result<Id, (Row, Id)>`, returning the rejected row and blocking ID on a unique conflict |
 | `get(id)` | `Option<&Row>` |
 | `contains(id)` | Whether the ID currently exists |
@@ -87,6 +88,10 @@ Generated tables provide:
 | `iter()` | Iterator of `(Id, &Row)` |
 | `get_by_<field>(&key)` | `Option<(Id, &Row)>` for a unique index |
 | `iter_by_<field>(&key)` | Iterator of `(Id, &Row)` for a many index |
+
+`next_id()` does not change the table. Rejected insertions do not consume the ID;
+a removal can change it by making a slot available for reuse. The method works
+for struct and enum tables in both storage modes and panics if capacity is exhausted.
 
 Noncached indexed fields require `Eq + Hash`; cached indexed fields also require
 `Clone`. Non-indexed fields have no additional bounds. Lookups support borrowed

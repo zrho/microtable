@@ -383,6 +383,13 @@ pub(super) fn expand(args: TokenStream2, mut row: syn::ItemEnum) -> syn::Result<
             #vis fn new() -> Self { ::std::default::Default::default() }
             #vis fn len(&self) -> usize { self.__rows.len() }
             #vis fn is_empty(&self) -> bool { self.len() == 0 }
+            /// The ID of the next successful insertion. Does not reserve the ID.
+            /// Rejected insertions do not change this value.
+            /// Panics if row storage capacity is exhausted.
+            #vis fn next_id(&self) -> #id {
+                ::std::assert!(self.__rows.can_insert(), "table capacity exhausted");
+                self.__rows.next_id()
+            }
             #vis fn get(&self, id: #id) -> ::std::option::Option<&#name #row_args> {
                 self.__rows.get(id).map(|entry| &entry.row)
             }

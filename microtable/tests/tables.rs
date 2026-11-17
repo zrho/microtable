@@ -52,12 +52,19 @@ fn members(table: &PersonTable, team: &str) -> Vec<u32> {
 fn insert_unique_checks_and_borrowed_lookup() {
     let mut table = PersonTable::default();
     assert!(table.is_empty());
+    let predicted = table.next_id();
+    assert_eq!(table.next_id(), predicted);
+    assert!(!table.contains(predicted));
+    assert!(table.is_empty());
     let id = table.insert(person(1, "red")).unwrap();
+    assert_eq!(id, predicted);
     assert_eq!(table.get_by_email("1@example.com").unwrap().0, id);
     assert_eq!(table.get_by_number(&1).unwrap().0, id);
     let mut rejected = person(1, "blue");
     rejected.email = "other@example.com".into();
+    let predicted = table.next_id();
     let error = table.insert(rejected).unwrap_err();
+    assert_eq!(table.next_id(), predicted);
     assert_eq!(error.1, id);
     assert_eq!(error.0.email, "other@example.com");
     assert_eq!(error.0.team, "blue");
@@ -571,8 +578,13 @@ fn custom_id_growth_and_free_list() {
         ($row:ident, $table:ident) => {{
             let mut table = $table::new();
             for key in 0..160 {
+                let predicted: TinyId = table.next_id();
+                assert_eq!(table.next_id(), predicted);
                 let first: TinyId = table.insert($row::First(key)).unwrap();
+                assert_eq!(first, predicted);
+                let predicted: TinyId = table.next_id();
                 let second: TinyId = table.insert($row::Second(key)).unwrap();
+                assert_eq!(second, predicted);
                 assert_eq!(first.index(), key as usize * 2);
                 assert_eq!(second.index(), key as usize * 2 + 1);
                 assert_ne!(first.0, first.index());
@@ -594,7 +606,9 @@ fn custom_id_growth_and_free_list() {
                     TinyId::new(key as usize * 2 + 1)
                 );
             }
+            let predicted = table.next_id();
             let error = table.insert($row::Second(128)).unwrap_err();
+            assert_eq!(table.next_id(), predicted);
             assert_eq!(error.0, $row::Second(128));
             assert_eq!(error.1, TinyId::new(257));
             assert_eq!(table.get_second_by_key(&128).unwrap().0, error.1);
@@ -634,7 +648,9 @@ fn custom_id_growth_and_free_list() {
     let second = enum_table.get_second_by_key(&0).unwrap().0;
     enum_table.remove(first);
     enum_table.remove(second);
+    assert_eq!(enum_table.next_id(), second);
     assert_eq!(enum_table.insert(TinyItem::First(160)).unwrap(), second);
+    assert_eq!(enum_table.next_id(), first);
     assert_eq!(enum_table.insert(TinyItem::Second(160)).unwrap(), first);
     assert_eq!(enum_table.get_first_by_key(&160).unwrap().0, second);
     assert_eq!(enum_table.get_second_by_key(&160).unwrap().0, first);
@@ -682,7 +698,9 @@ fn custom_id_growth_and_free_list() {
     assert_eq!(table.iter_by_group(&0).take(321).count(), 160);
     table.remove(ids[5]);
     table.remove(ids[8]);
+    assert_eq!(table.next_id(), ids[8]);
     let a = table.insert(Tiny { group: 0 }).unwrap();
+    assert_eq!(table.next_id(), ids[5]);
     let b = table.insert(Tiny { group: 0 }).unwrap();
     assert_eq!(a.index(), 8);
     assert_eq!(b.index(), 5);
@@ -694,11 +712,13 @@ fn custom_id_growth_and_free_list() {
 
     let mut append = AppendTinyTable::new();
     for value in 0..320 {
+        let predicted: TinyId = append.next_id();
         let id: TinyId = append
             .insert(AppendTiny {
                 group: (value % 2) as u8,
             })
             .unwrap();
+        assert_eq!(id, predicted);
         assert_eq!(id.index(), value);
         assert_ne!(id.0, value);
         assert!(append.contains(id));

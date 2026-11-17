@@ -34,7 +34,7 @@ impl<T, Id: Copy> Arena<T, Id> {
         self.len() == 0
     }
 
-    fn next_id(&self) -> Id {
+    pub fn next_id(&self) -> Id {
         (self.from_index)(self.slots.next_index())
     }
 

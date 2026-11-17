@@ -455,6 +455,13 @@ fn expand(args: TokenStream2, mut row: ItemStruct) -> syn::Result<TokenStream2> 
             #vis fn len(&self) -> usize { self.__rows.len() }
             /// Whether the table contains no rows.
             #vis fn is_empty(&self) -> bool { self.len() == 0 }
+            /// The ID of the next successful insertion. Does not reserve the ID.
+            /// Rejected insertions do not change this value.
+            /// Panics if row storage capacity is exhausted.
+            #vis fn next_id(&self) -> #id {
+                ::std::assert!(self.__rows.can_insert(), "table capacity exhausted");
+                self.__rows.next_id()
+            }
             #[doc = #get_doc]
             #vis fn get(&self, id: #id) -> ::std::option::Option<&#name #row_args> {
                 self.__rows.get(id).map(|entry| &entry.row)
