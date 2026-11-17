@@ -1,4 +1,4 @@
-//! Hash indexes with local extractor outputs and linked many groups.
+//! Hash and dense indexes with local extractor outputs and linked many groups.
 use super::{Index, Kind};
 use proc_macro2::TokenStream as Tokens;
 use quote::{format_ident, quote};
@@ -14,6 +14,7 @@ pub(super) struct Code {
     pub prepare: Vec<Tokens>,
     pub checks_insert: Vec<Tokens>,
     pub checks_replace: Vec<Tokens>,
+    pub checks_capacity: Vec<Tokens>,
     pub reserve: Vec<Tokens>,
     pub detach: Vec<Tokens>,
     pub commit: Vec<Tokens>,
@@ -199,7 +200,9 @@ pub(super) fn generate(indexes: &[Index], context: &Context<'_>) -> Code {
             let __key = #stored.expect("indexed key");
             ::std::hash::BuildHasher::hash_one(__hasher, &__key)
         });
-        let find = if index.cached {
+        let find = if index.dense {
+            quote!(self.#map.get(__hash).copied().flatten())
+        } else if index.cached {
             quote!(self.#map.raw_entry().from_hash(__hash, |candidate| candidate.key == *__key).map(|(candidate, ())| candidate.id))
         } else {
             quote!({ let __rows = &self.__rows; self.#map.find(__hash, |__candidate| {
@@ -207,8 +210,32 @@ pub(super) fn generate(indexes: &[Index], context: &Context<'_>) -> Code {
             }).copied() })
         };
         // For noncached keys, end the borrow of the incoming row at validation.
-        // Only hashes and IDs survive until the arena row has been installed.
-        if index.cached {
+        // Only hashes, dense positions, and IDs survive until the row is installed.
+        if index.dense {
+            let needed = format_ident!("__needed_{}", name.unraw());
+            code.map_fields
+                .push(quote!(#map: ::std::vec::Vec<::std::option::Option<#id>>));
+            code.map_defaults.push(quote!(#map: ::std::vec::Vec::new()));
+            code.prepare.push(
+                quote!(let #key: ::std::option::Option<usize> = #incoming; let #hash = #key;),
+            );
+            code.checks_capacity.push(quote! {
+                let #needed = #hash.map(|position| {
+                    let length = position.checked_add(1).expect("table capacity exhausted");
+                    if length > (isize::MAX as usize) / ::std::mem::size_of::<::std::option::Option<#id>>() {
+                        panic!("table capacity exhausted");
+                    }
+                    length
+                });
+            });
+            code.reserve.push(quote! {
+                if let ::std::option::Option::Some(length) = #needed {
+                    if length > self.#map.len() {
+                        self.#map.resize(length, ::std::option::Option::None);
+                    }
+                }
+            });
+        } else if index.cached {
             code.map_fields.push(quote!(#map: #runtime::__private::HashMap<#runtime::__private::CachedKey<#ty, #id>, (), #hasher>));
             code.map_defaults.push(quote!(#map: #runtime::__private::HashMap::with_hasher(::std::clone::Clone::clone(&__hasher))));
             code.reserve.push(quote!(self.#map.reserve(1);));
@@ -223,7 +250,9 @@ pub(super) fn generate(indexes: &[Index], context: &Context<'_>) -> Code {
         }
         // Only mutable cached indexes need stored hashes. Noncached indexes
         // derive membership and the old hash from the live row.
-        let old_hash = if index.cached {
+        let old_hash = if index.dense {
+            current.clone()
+        } else if index.cached {
             if !append_only {
                 code.entry_fields
                     .push(quote!(#saved: ::std::option::Option<u64>));
@@ -247,7 +276,9 @@ pub(super) fn generate(indexes: &[Index], context: &Context<'_>) -> Code {
                 }
             });
         }
-        let remove = if index.cached {
+        let remove = if index.dense {
+            quote!(self.#map[__old_hash] = ::std::option::Option::None;)
+        } else if index.cached {
             quote! { match self.#map.raw_entry_mut().from_hash(__old_hash, |key| key.id == id) {
                 #runtime::__private::RawEntryMut::Occupied(entry) => { entry.remove_entry(); },
                 _ => unreachable!("present index"),
@@ -255,7 +286,9 @@ pub(super) fn generate(indexes: &[Index], context: &Context<'_>) -> Code {
         } else {
             quote!(self.#map.find_entry(__old_hash, |stored| *stored == id).expect("present index").remove();)
         };
-        let insert = if index.cached {
+        let insert = if index.dense {
+            quote!(self.#map[__hash] = ::std::option::Option::Some(id);)
+        } else if index.cached {
             quote! { match self.#map.raw_entry_mut().from_hash(__hash, |_| false) {
                 #runtime::__private::RawEntryMut::Vacant(entry) => { entry.insert_hashed_nocheck(__hash, #runtime::__private::CachedKey { key: __owned_key, id }, ()); },
                 _ => unreachable!("vacant index"),
@@ -264,7 +297,9 @@ pub(super) fn generate(indexes: &[Index], context: &Context<'_>) -> Code {
             quote! { let __rows = &self.__rows; let __hasher = &self.__hasher; self.#map.insert_unique(__hash, id, #rehash); }
         };
         let change_head = |hash: Tokens, old: Tokens, new: Tokens| {
-            if index.cached {
+            if index.dense {
+                quote!(self.#map[#hash] = ::std::option::Option::Some(#new);)
+            } else if index.cached {
                 quote! { match self.#map.raw_entry_mut().from_hash(#hash, |key| key.id == #old) {
                     #runtime::__private::RawEntryMut::Occupied(mut entry) => { entry.key_mut().id = #new; },
                     _ => unreachable!("present head"),
@@ -305,7 +340,9 @@ pub(super) fn generate(indexes: &[Index], context: &Context<'_>) -> Code {
                         }
                     });
                 }
-                let group_find = if index.cached {
+                let group_find = if index.dense {
+                    quote!(let head = #find;)
+                } else if index.cached {
                     quote!(let __owned_key = #key.expect("prepared key"); let __key = &__owned_key; let head = #find;)
                 } else {
                     quote!(let head = { let __new_key = #current.expect("indexed key"); let __key = &__new_key; #find };)
@@ -350,9 +387,15 @@ fn lookup(
     let append_only = context.append_only;
     let table_generics = context.generics;
     let key_type = with_lifetime(&index.key, syn::parse_quote!('__mt_table));
-    let (query_generics, parameter, bounds, equal, _captures) = if let syn::Type::Tuple(tuple) =
-        &key_type
-    {
+    let (query_generics, parameter, bounds, equal, _captures) = if index.dense {
+        (
+            quote!(),
+            quote!(value: &usize),
+            quote!(),
+            quote!(),
+            quote!(),
+        )
+    } else if let syn::Type::Tuple(tuple) = &key_type {
         let mut queries = Vec::new();
         let mut parts = Vec::new();
         let mut comparisons = Vec::new();
@@ -438,7 +481,11 @@ fn lookup(
     } else {
         quote!(self.#map.find(__hash, |__candidate| { #stored.is_some_and(|__stored_key| { let __stored_key = &__stored_key; #equal }) }).copied())
     };
-    let search = quote!(let __hash = ::std::hash::BuildHasher::hash_one(&self.__hasher, value); let head = #find;);
+    let search = if index.dense {
+        quote!(let head = self.#map.get(*value).copied().flatten();)
+    } else {
+        quote!(let __hash = ::std::hash::BuildHasher::hash_one(&self.__hasher, value); let head = #find;)
+    };
     let name = &index.function.sig.ident;
     match index.kind {
         Kind::Unique => {

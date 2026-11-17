@@ -99,6 +99,37 @@ its computation. Cached keys cannot borrow from the temporary row reference;
 owned keys such as `String` work. Keys need `Eq + Hash`, but not `Clone` unless
 needed to clone a cached table. Tuple lookups take one tuple reference.
 
+## Dense integer indexes
+
+For small integer domains, `dense` uses a `Vec<Option<Id>>` instead of hashing:
+
+```rust
+struct Session {
+    slot: usize,
+    worker: Option<usize>,
+}
+
+microtable::table! {
+    struct Sessions([Session]);
+
+    #[index(unique, dense)]
+    fn slot(session: &Session) -> usize { session.slot }
+
+    #[index(many, dense, optional)]
+    fn worker(session: &Session) -> Option<usize> { session.worker }
+}
+```
+
+Look up rows with `sessions.get_by_slot(&3)` or
+`sessions.iter_by_worker(&7)`. Keys must be `usize`, or `Option<usize>` with
+`optional`. Out-of-range lookups return no matches. Dense indexes cannot be
+`cached`.
+
+The vector grows to include the highest key and does not shrink on removal.
+Memory therefore depends on the highest key, not the row count: use closely
+spaced keys. Growth initializes empty entries; impossible vector lengths panic
+before changing rows or index entries.
+
 ## Optional indexes and enums
 
 `optional` lets an extractor return `None` to exclude a row from an index. This

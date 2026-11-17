@@ -35,6 +35,7 @@ struct Index {
     function: syn::ItemFn,
     kind: Kind,
     cached: bool,
+    dense: bool,
     optional: bool,
     key: syn::Type,
 }
@@ -168,6 +169,7 @@ impl Parse for Declaration {
                     })?;
                     let mut kind = None;
                     let mut cached = false;
+                    let mut dense = false;
                     let mut optional = false;
                     let mut seen = HashSet::new();
                     attr.parse_nested_meta(|meta| {
@@ -195,16 +197,28 @@ impl Parse for Declaration {
                                 cached = true;
                                 Ok(())
                             }
+                            "dense" => {
+                                dense = true;
+                                Ok(())
+                            }
                             "optional" => {
                                 optional = true;
                                 Ok(())
                             }
-                            _ => Err(meta.error("expected unique, many, cached, or optional")),
+                            _ => {
+                                Err(meta.error("expected unique, many, cached, dense, or optional"))
+                            }
                         }
                     })?;
                     let kind = kind.ok_or_else(|| {
                         syn::Error::new(attr.span(), "index requires unique or many")
                     })?;
+                    if dense && cached {
+                        return Err(syn::Error::new(
+                            attr.span(),
+                            "dense and cached are mutually exclusive",
+                        ));
+                    }
                     for attr in &function.attrs {
                         if attr.path().is_ident("cfg") || attr.path().is_ident("cfg_attr") {
                             return Err(syn::Error::new(
@@ -251,6 +265,7 @@ impl Parse for Declaration {
                         function,
                         kind,
                         cached,
+                        dense,
                         optional,
                         key,
                     });
@@ -645,6 +660,7 @@ fn expand(declaration: Declaration) -> syn::Result<Tokens> {
         prepare,
         checks_insert,
         checks_replace,
+        checks_capacity,
         reserve,
         detach,
         commit,
@@ -698,7 +714,7 @@ fn expand(declaration: Declaration) -> syn::Result<Tokens> {
             let __conflict = (|| { #(#checks_replace)* ::std::option::Option::None })();
             #(#release)*
             if let ::std::option::Option::Some(kind) = __conflict { return ::std::result::Result::Err(#runtime::ReplaceError { row, kind }); }
-            #(#reserve)* #(#detach)*
+            #(#checks_capacity)* #(#reserve)* #(#detach)*
             let entry = #entry { row, #(#entry_defaults,)* };
             let old = ::std::mem::replace(self.__rows.get_mut(id).expect("present row"), entry);
             #(#commit)*
@@ -755,7 +771,7 @@ fn expand(declaration: Declaration) -> syn::Result<Tokens> {
                 if let ::std::option::Option::Some(existing) = __conflict { return ::std::result::Result::Err((row, existing)); }
                 // next_id converts before any reservation or index mutation.
                 let id = self.next_id();
-                #reserve_rows #(#reserve)*
+                #(#checks_capacity)* #reserve_rows #(#reserve)*
                 let entry = #entry { row, #(#entry_defaults,)* };
                 #insert_row #(#commit)* ::std::result::Result::Ok(id)
             }
