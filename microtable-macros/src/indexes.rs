@@ -11,6 +11,7 @@ pub(super) struct Context<'a> {
     pub name: &'a syn::Ident,
     pub row_args: TokenStream,
     pub id: &'a syn::Type,
+    pub hasher: &'a syn::Type,
     pub vis: &'a syn::Visibility,
     pub append_only: bool,
     pub variant: Option<VariantContext<'a>>,
@@ -108,7 +109,12 @@ impl Code {
     }
 
     fn add(&mut self, index: &Index, context: &Context<'_>) {
-        let Context { runtime, id, .. } = context;
+        let Context {
+            runtime,
+            id,
+            hasher,
+            ..
+        } = context;
         let metadata = context.metadata(false);
         let metadata_mut = context.metadata(true);
         let field = &index.name;
@@ -154,10 +160,10 @@ impl Code {
         });
         if index.cached {
             self.map_fields.push(quote! {
-                #map: #runtime::__private::HashMap<#runtime::__private::CachedKey<#ty, #id>, (), ::std::collections::hash_map::RandomState>
+                #map: #runtime::__private::HashMap<#runtime::__private::CachedKey<#ty, #id>, (), #hasher>
             });
             self.map_defaults
-                .push(quote!(#map: #runtime::__private::HashMap::with_hasher(__hasher.clone())));
+                .push(quote!(#map: #runtime::__private::HashMap::with_hasher(::std::clone::Clone::clone(&__hasher))));
             if !context.append_only {
                 self.entry_fields.push(quote!(#saved_hash: u64));
                 self.entry_defaults.push(quote!(#saved_hash: #hash));

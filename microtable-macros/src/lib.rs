@@ -18,6 +18,8 @@ use attributes::{IndexMode, IndexOptions, TableOptions};
 /// Options: `table = Name` and optional `id = Type` with
 /// `id_from_index = function_or_closure` and `id_to_index = function_or_closure`.
 /// IDs default to `usize`. Custom ID callbacks convert directly to/from `usize`.
+/// `hasher = Type` selects a `BuildHasher + Clone + Default` hash builder,
+/// defaulting to `std::collections::hash_map::RandomState`.
 /// `append_only` selects dense storage and omits removal and replacement methods.
 /// Field attributes: `#[indexed(unique)]` or `#[indexed(many)]`.
 /// Named struct attributes: `#[index(name = pair, unique, fields(a, b))]` or
@@ -209,6 +211,9 @@ fn expand(args: TokenStream2, mut row: ItemStruct) -> syn::Result<TokenStream2> 
     let vis = &row.vis;
     let options: TableOptions = attributes::parse(args)?;
     let append_only = options.append_only;
+    let hasher: syn::Type = options
+        .hasher
+        .unwrap_or_else(|| syn::parse_quote!(::std::collections::hash_map::RandomState));
     let table = options
         .table
         .unwrap_or_else(|| format_ident!("{}Table", name.unraw()));
@@ -311,6 +316,12 @@ fn expand(args: TokenStream2, mut row: ItemStruct) -> syn::Result<TokenStream2> 
         .make_where_clause()
         .predicates
         .push(syn::parse_quote!(
+            #hasher: ::std::hash::BuildHasher + ::std::clone::Clone + ::std::default::Default
+        ));
+    table_generics
+        .make_where_clause()
+        .predicates
+        .push(syn::parse_quote!(
             #id: ::std::marker::Copy + ::std::cmp::Eq
         ));
     for index in &indexes {
@@ -349,6 +360,7 @@ fn expand(args: TokenStream2, mut row: ItemStruct) -> syn::Result<TokenStream2> 
             name: &name,
             row_args: quote!(#row_args),
             id: &id,
+            hasher: &hasher,
             vis,
             append_only,
             variant: None,
@@ -419,14 +431,14 @@ fn expand(args: TokenStream2, mut row: ItemStruct) -> syn::Result<TokenStream2> 
         #[doc = #table_doc]
         #vis struct #table #table_generics #table_where {
             __rows: #arena<#entry #row_args, #id>,
-            __hasher: ::std::collections::hash_map::RandomState,
+            __hasher: #hasher,
             #(#map_fields,)*
         }
 
         #(#cfg)*
         impl #impl_generics ::std::default::Default for #table #type_generics #table_where {
             fn default() -> Self {
-                let __hasher = ::std::collections::hash_map::RandomState::new();
+                let __hasher: #hasher = ::std::default::Default::default();
                 Self {
                     __rows: #arena::new(#id_from_index, #id_to_index),
                     #(#map_defaults,)*

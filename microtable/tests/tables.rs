@@ -1,6 +1,21 @@
 use microtable::{ReplaceErrorKind, table};
 
-#[table]
+type CollisionBuilder = std::hash::BuildHasherDefault<CollisionHasher>;
+type StableBuilder = std::hash::BuildHasherDefault<std::collections::hash_map::DefaultHasher>;
+
+// Force distinct keys into the same bucket in mutable and append-only indexes.
+#[derive(Default)]
+struct CollisionHasher;
+
+impl std::hash::Hasher for CollisionHasher {
+    fn finish(&self) -> u64 {
+        0
+    }
+
+    fn write(&mut self, _: &[u8]) {}
+}
+
+#[table(hasher = std::hash::BuildHasherDefault<CollisionHasher>)]
 #[derive(Debug, PartialEq, Eq)]
 pub struct Person {
     #[indexed(unique)]
@@ -543,8 +558,12 @@ macro_rules! tiny_enum {
     };
 }
 
-tiny_enum!(TinyItem);
-tiny_enum!(AppendTinyItem, append_only = true);
+tiny_enum!(TinyItem, hasher = CollisionBuilder);
+tiny_enum!(
+    AppendTinyItem,
+    append_only = true,
+    hasher = CollisionBuilder
+);
 
 #[test]
 fn custom_id_growth_and_free_list() {
@@ -564,6 +583,17 @@ fn custom_id_growth_and_free_list() {
             }
             assert_eq!(table.len(), 320);
             assert_eq!(table.iter().count(), 320);
+            // Query every old key after growth has rehashed both index types.
+            for key in 0..160 {
+                assert_eq!(
+                    table.get_first_by_key(&key).unwrap().0,
+                    TinyId::new(key as usize * 2)
+                );
+                assert_eq!(
+                    table.get_second_by_key(&key).unwrap().0,
+                    TinyId::new(key as usize * 2 + 1)
+                );
+            }
             let error = table.insert($row::Second(128)).unwrap_err();
             assert_eq!(error.0, $row::Second(128));
             assert_eq!(error.1, TinyId::new(257));
@@ -581,6 +611,10 @@ fn custom_id_growth_and_free_list() {
                         .collect::<Vec<_>>(),
                 ] {
                     assert_eq!(rows.len(), 80);
+                    let mut ids: Vec<_> = rows.iter().map(|(id, _)| id.index()).collect();
+                    ids.sort_unstable();
+                    ids.dedup();
+                    assert_eq!(ids.len(), 80); // Each ring visits each row exactly once.
                     for (id, row) in rows {
                         assert_eq!(table.get(id), Some(row));
                         let key = match row {
@@ -610,6 +644,26 @@ fn custom_id_growth_and_free_list() {
     assert_eq!(enum_table.iter_first_by_group(&0).count(), 79);
     assert_eq!(enum_table.iter_second_by_group(&0).count(), 80);
     assert_eq!(enum_table.iter_second_by_group(&1).count(), 81);
+
+    // Remove the current representatives from both cached and noncached groups.
+    let first_head = enum_table.iter_first_by_group(&0).next().unwrap().0;
+    let second_head = enum_table.iter_second_by_group(&0).next().unwrap().0;
+    enum_table.remove(first_head).unwrap();
+    enum_table.remove(second_head).unwrap();
+    assert_eq!(enum_table.iter_first_by_group(&0).count(), 78);
+    assert_eq!(enum_table.iter_second_by_group(&0).count(), 79);
+    let first_head = enum_table.iter_first_by_group(&0).next().unwrap().0;
+    let second_head = enum_table.iter_second_by_group(&0).next().unwrap().0;
+    enum_table
+        .replace(first_head, TinyItem::First(162))
+        .unwrap();
+    enum_table
+        .replace(second_head, TinyItem::Second(162))
+        .unwrap();
+    assert_eq!(enum_table.get_first_by_key(&162).unwrap().0, first_head);
+    assert_eq!(enum_table.get_second_by_key(&162).unwrap().0, second_head);
+    assert_eq!(enum_table.iter_first_by_group(&0).count(), 78);
+    assert_eq!(enum_table.iter_second_by_group(&0).count(), 79);
 
     let mut table = TinyTable::new();
     let ids: Vec<_> = (0..320)
@@ -700,8 +754,8 @@ macro_rules! generic_row {
     };
 }
 
-generic_row!(Generic);
-generic_row!(AppendGeneric, append_only = true);
+generic_row!(Generic, hasher = StableBuilder);
+generic_row!(AppendGeneric, append_only = true, hasher = CollisionBuilder);
 
 #[test]
 fn generic_rows_lifetimes_and_non_indexed_data() {

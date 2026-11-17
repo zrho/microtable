@@ -223,8 +223,33 @@ error leaves the table unchanged. Replacements can keep their own unique values.
 Using `unwrap()` on an insert result requires both `Row: Debug` and `Id: Debug`.
 Using `unwrap()` on a replacement result requires `Row: Debug`.
 
-Indexes use `hashbrown` with a shared `std::hash::RandomState` hasher. Noncached
-indexes use `HashTable<Id>` and derive keys from rows. Cached indexes use
+## Hash builder
+
+Tables use `std::collections::hash_map::RandomState` by default. Select a different
+hash builder by type:
+
+```rust
+#[microtable::table(
+    hasher = std::hash::BuildHasherDefault<std::collections::hash_map::DefaultHasher>
+)]
+struct Record {
+    #[indexed(unique)]
+    key: String,
+}
+```
+
+The type must implement `std::hash::BuildHasher + Clone + Default`. The table
+creates one shared builder with `Default` and clones it into cached index maps.
+Clones must produce equivalent hashes for the same keys. All noncached hashing,
+queries, and rehashing use the chosen builder too. This option works for structs,
+enums, mutable tables, and append-only tables. It accepts only a type, not an
+initializer; `new()` and `default()` remain the constructors.
+
+The default builder protects against hash collision attacks. Deterministic or
+constant-hash test builders are not recommended for hostile input.
+
+Indexes use `hashbrown`. Noncached indexes use `HashTable<Id>` and derive keys
+from rows. Cached indexes use
 `HashMap` and own their keys. Each cached key includes its representative row ID
 as metadata that does not affect hashing or equality. Each entry holds one row
 ID for a unique index or a representative ID for a many index. In mutable

@@ -1,5 +1,20 @@
 use microtable::{ReplaceErrorKind, table};
 
+type CollisionBuilder = std::hash::BuildHasherDefault<CollisionHasher>;
+type StableBuilder = std::hash::BuildHasherDefault<std::collections::hash_map::DefaultHasher>;
+
+// Deliberate collisions exercise equality checks and representative changes.
+#[derive(Default)]
+struct CollisionHasher;
+
+impl std::hash::Hasher for CollisionHasher {
+    fn finish(&self) -> u64 {
+        0
+    }
+
+    fn write(&mut self, _: &[u8]) {}
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct NamedId(usize);
 
@@ -50,13 +65,20 @@ macro_rules! member_row {
     };
 }
 
-member_row!(Member, MemberTable, member, group);
+member_row!(
+    Member,
+    MemberTable,
+    member,
+    group,
+    hasher = CollisionBuilder
+);
 member_row!(
     AppendMember,
     AppendMemberTable,
     append_member,
     append_group,
-    append_only
+    append_only,
+    hasher = CollisionBuilder
 );
 
 #[derive(Debug, PartialEq, Eq)]
@@ -94,8 +116,8 @@ macro_rules! item_enum {
     };
 }
 
-item_enum!(Item);
-item_enum!(AppendItem, append_only);
+item_enum!(Item, hasher = CollisionBuilder);
+item_enum!(AppendItem, append_only, hasher = CollisionBuilder);
 
 #[test]
 fn named_indexes_coexist_and_support_borrowed_queries() {
@@ -410,7 +432,7 @@ macro_rules! generic_row {
     };
 }
 
-generic_row!(Generic);
+generic_row!(Generic, hasher = StableBuilder);
 generic_row!(AppendGeneric, append_only = true);
 
 struct GenericPayload<'a, T, const N: usize> {
@@ -436,8 +458,8 @@ macro_rules! generic_enum {
     };
 }
 
-generic_enum!(GenericItem);
-generic_enum!(AppendGenericItem, append_only);
+generic_enum!(GenericItem, hasher = CollisionBuilder);
+generic_enum!(AppendGenericItem, append_only, hasher = StableBuilder);
 
 #[test]
 fn named_indexes_support_generics_and_borrowed_computed_outputs() {
@@ -546,7 +568,7 @@ macro_rules! computed_row {
     };
 }
 
-computed_row!(Computed, compute_once);
+computed_row!(Computed, compute_once, hasher = CollisionBuilder);
 computed_row!(AppendComputed, append_compute_once, append_only);
 
 #[derive(Debug)]
@@ -576,7 +598,7 @@ macro_rules! computed_enum {
 }
 
 computed_enum!(ComputedItem);
-computed_enum!(AppendComputedItem, append_only);
+computed_enum!(AppendComputedItem, append_only, hasher = CollisionBuilder);
 
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct ComputedKey(u32);

@@ -11,6 +11,7 @@ pub(super) struct TableOptions {
     pub append_only: bool,
     pub table: Option<syn::Ident>,
     pub id: Option<syn::Type>,
+    pub hasher: Option<syn::Type>,
     pub id_from_index: Option<syn::Expr>,
     pub id_to_index: Option<syn::Expr>,
 }
@@ -71,7 +72,9 @@ impl Parse for OptionMeta {
     fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
         let fork = input.fork();
         let path: syn::Path = fork.parse()?;
-        if (path.is_ident("id") || path.is_ident("key_type")) && fork.peek(syn::Token![=]) {
+        if (path.is_ident("id") || path.is_ident("key_type") || path.is_ident("hasher"))
+            && fork.peek(syn::Token![=])
+        {
             let path: syn::Path = input.parse()?;
             let eq_token = input.parse()?;
             let ty: syn::Type = input.parse()?;

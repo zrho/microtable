@@ -117,7 +117,16 @@
 //! borrow data with an existing row lifetime, but cannot borrow from the row's
 //! owned fields. All stored keys must retain stable hash and equality behavior.
 //!
-//! Indexes use `hashbrown` with a shared `std::hash::RandomState` hasher.
+//! Indexes use `hashbrown` with a shared hash builder, defaulting to
+//! `std::collections::hash_map::RandomState`. Set `hasher = Type` on `#[table]`
+//! to select another builder, for example
+//! `hasher = std::hash::BuildHasherDefault<std::collections::hash_map::DefaultHasher>`.
+//! The type must implement `BuildHasher + Clone + Default`. Each table constructs
+//! one default builder and clones it into cached maps. Clones must produce the
+//! same hash for the same key as the original builder. Both cached and noncached
+//! indexes use the chosen builder, including lookups and rehashing. Choose a
+//! builder suitable for the keys and any untrusted input.
+//!
 //! Noncached indexes use `HashTable<Id>` and derive keys from rows. Cached
 //! indexes use `HashMap` and own the key. Cached keys include a representative
 //! row ID as metadata that does not affect hashing or equality. Each entry holds

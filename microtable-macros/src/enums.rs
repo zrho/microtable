@@ -20,6 +20,9 @@ pub(super) fn expand(args: TokenStream2, mut row: syn::ItemEnum) -> syn::Result<
     }
     let options: attributes::TableOptions = attributes::parse(args)?;
     let append_only = options.append_only;
+    let hasher: syn::Type = options
+        .hasher
+        .unwrap_or_else(|| syn::parse_quote!(::std::collections::hash_map::RandomState));
     let table = options
         .table
         .unwrap_or_else(|| format_ident!("{}Table", name.unraw()));
@@ -157,6 +160,12 @@ pub(super) fn expand(args: TokenStream2, mut row: syn::ItemEnum) -> syn::Result<
     table_generics
         .make_where_clause()
         .predicates
+        .push(syn::parse_quote!(
+            #hasher: ::std::hash::BuildHasher + ::std::clone::Clone + ::std::default::Default
+        ));
+    table_generics
+        .make_where_clause()
+        .predicates
         .push(syn::parse_quote!(#id: ::std::marker::Copy + ::std::cmp::Eq));
     for index in all_indexes.iter().flatten() {
         for ty in index.types() {
@@ -230,6 +239,7 @@ pub(super) fn expand(args: TokenStream2, mut row: syn::ItemEnum) -> syn::Result<
                 name: &name,
                 row_args: quote!(#row_args),
                 id: &id,
+                hasher: &hasher,
                 vis,
                 append_only,
                 variant: Some(indexes::VariantContext {
@@ -352,14 +362,14 @@ pub(super) fn expand(args: TokenStream2, mut row: syn::ItemEnum) -> syn::Result<
         #(#cfg)*
         #vis struct #table #table_generics #table_where {
             __rows: #arena<#entry #row_args, #id>,
-            __hasher: ::std::collections::hash_map::RandomState,
+            __hasher: #hasher,
             #(#map_fields,)*
         }
 
         #(#cfg)*
         impl #impl_generics ::std::default::Default for #table #type_generics #table_where {
             fn default() -> Self {
-                let __hasher = ::std::collections::hash_map::RandomState::new();
+                let __hasher: #hasher = ::std::default::Default::default();
                 Self {
                     __rows: #arena::new(#id_from_index, #id_to_index),
                     #(#map_defaults,)*
