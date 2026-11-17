@@ -1,46 +1,28 @@
-//! Attribute expansion for `microtable`.
+//! Function-like table declarations for `microtable`.
 #![forbid(unsafe_code)]
 
-use std::collections::HashSet;
-
 use proc_macro::TokenStream;
-use proc_macro2::TokenStream as TokenStream2;
+use proc_macro2::TokenStream as Tokens;
 use quote::{format_ident, quote};
-use syn::{Fields, ItemStruct, ext::IdentExt, parse_macro_input, spanned::Spanned};
+use std::collections::HashSet;
+use syn::{
+    ext::IdentExt,
+    parse::{Parse, ParseStream},
+    parse_macro_input,
+    spanned::Spanned,
+};
 
-mod attributes;
-mod enums;
 mod indexes;
+#[cfg(test)]
+mod tests;
 mod traits;
-use attributes::{IndexMode, IndexOptions, TableOptions};
 
-/// Generate a table from a named-field struct or singleton-tuple-variant enum.
-///
-/// Options: `table = Name` and optional `id = Type` with
-/// `id_from_index = function_or_closure` and `id_to_index = function_or_closure`.
-/// IDs default to `usize`. Custom ID callbacks convert directly to/from `usize`.
-/// `hasher = Type` selects a `BuildHasher + Clone + Default` hash builder,
-/// defaulting to `std::collections::hash_map::RandomState`.
-/// `append_only` selects dense storage and omits removal and replacement methods.
-/// Field attributes: `#[indexed(unique)]` or `#[indexed(many)]`.
-/// Named struct attributes: `#[index(name = pair, unique, fields(a, b))]` or
-/// `#[index(name = derived, many, key_type = String, key = compute_key)]`.
-/// Both index forms accept `cached` or `cached = false`. Field/composite keys
-/// default to non-cached storage; computed keys default to cached storage.
-/// Tables copy `Debug` and `Clone` from the row's derive attributes. `Debug`
-/// displays IDs and rows. `Clone` also requires stored index keys to be cloneable.
-#[proc_macro_attribute]
-pub fn table(args: TokenStream, input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as syn::Item);
-    let result = match input {
-        syn::Item::Struct(row) => expand(args.into(), row),
-        syn::Item::Enum(row) => enums::expand(args.into(), row),
-        item => Err(syn::Error::new(
-            item.span(),
-            "table requires a struct or enum",
-        )),
-    };
-    result.unwrap_or_else(syn::Error::into_compile_error).into()
+#[proc_macro]
+pub fn table(input: TokenStream) -> TokenStream {
+    let declaration = parse_macro_input!(input as Declaration);
+    expand(declaration)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
 }
 
 #[derive(Clone, Copy)]
@@ -49,135 +31,477 @@ enum Kind {
     Many,
 }
 
-enum IndexKey {
-    Fields(Vec<(syn::Ident, syn::Type)>),
-    Computed {
-        ty: Box<syn::Type>,
-        expression: Box<syn::Expr>,
-    },
-}
-
 struct Index {
-    name: syn::Ident,
-    lookup_name: syn::Ident,
+    function: syn::ItemFn,
     kind: Kind,
-    key: IndexKey,
     cached: bool,
+    optional: bool,
+    key: syn::Type,
 }
 
-impl Index {
-    fn types(&self) -> Vec<&syn::Type> {
-        match &self.key {
-            IndexKey::Fields(fields) => fields.iter().map(|(_, ty)| ty).collect(),
-            IndexKey::Computed { ty, .. } => vec![ty],
-        }
-    }
+struct Declaration {
+    table: syn::ItemStruct,
+    row: syn::Type,
+    id: Option<syn::ItemStruct>,
+    indexes: Vec<Index>,
+    append_only: bool,
+    hasher: syn::Type,
+}
 
-    fn key_type(&self) -> TokenStream2 {
-        let types = self.types();
-        if types.len() == 1 {
-            let ty = types[0];
-            quote!(#ty)
+fn take_attribute(
+    attrs: &mut Vec<syn::Attribute>,
+    name: &str,
+) -> syn::Result<Option<syn::Attribute>> {
+    let mut result = None;
+    let mut retained = Vec::new();
+    for attr in std::mem::take(attrs) {
+        if attr.path().is_ident(name) {
+            if result.is_some() {
+                return Err(syn::Error::new(
+                    attr.span(),
+                    format!("duplicate {name} attribute"),
+                ));
+            }
+            result = Some(attr);
         } else {
-            quote!((#(#types,)*))
+            retained.push(attr);
         }
     }
-
-    // Tuple references hash identically to owned tuples without cloning components.
-    fn borrowed(&self, row: &TokenStream2, computed: &TokenStream2) -> TokenStream2 {
-        match &self.key {
-            IndexKey::Computed { .. } => quote!(&#computed),
-            IndexKey::Fields(fields) if fields.len() == 1 => {
-                let field = &fields[0].0;
-                quote!(&#row.#field)
-            }
-            IndexKey::Fields(fields) => {
-                let fields = fields.iter().map(|(field, _)| field);
-                quote!(&(#(&#row.#fields,)*))
-            }
-        }
-    }
-
-    fn equivalent(&self, row: &TokenStream2, computed: &TokenStream2) -> TokenStream2 {
-        match &self.key {
-            IndexKey::Fields(fields) if fields.len() > 1 => {
-                let comparisons = fields.iter().enumerate().map(|(i, (field, _))| {
-                    let i = syn::Index::from(i);
-                    quote!(::std::cmp::PartialEq::eq(&__stored_key.#i, &#row.#field))
-                });
-                quote!(#(#comparisons)&&*)
-            }
-            _ => {
-                let borrowed = self.borrowed(row, computed);
-                quote!(::std::cmp::PartialEq::eq(__stored_key, #borrowed))
-            }
-        }
-    }
-
-    fn cloned(&self, row: &TokenStream2, computed: &TokenStream2) -> TokenStream2 {
-        match &self.key {
-            IndexKey::Fields(fields) if fields.len() > 1 => {
-                let fields = fields.iter().map(|(field, _)| field);
-                quote!((#(::std::clone::Clone::clone(&#row.#fields),)*))
-            }
-            _ => {
-                let borrowed = self.borrowed(row, computed);
-                quote!(::std::clone::Clone::clone(#borrowed))
-            }
-        }
-    }
+    *attrs = retained;
+    Ok(result)
 }
 
-fn parse_index(attr: &syn::Attribute, fields: &syn::FieldsNamed) -> syn::Result<Index> {
-    let options: IndexOptions = attributes::parse_attribute(attr)?;
-    let name = options.name;
-    let kind = options.mode.kind(attr.span())?;
-    let key = match (options.fields, options.key_type, options.key) {
-        (Some(attributes::FieldList(selected)), None, None) => {
-            if selected.is_empty() {
-                return Err(syn::Error::new(attr.span(), "fields must not be empty"));
+impl Parse for Declaration {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        let mut table: syn::ItemStruct = input.parse()?;
+        for param in &table.generics.params {
+            let ident = match param {
+                syn::GenericParam::Type(param) => &param.ident,
+                syn::GenericParam::Const(param) => &param.ident,
+                syn::GenericParam::Lifetime(param) => &param.lifetime.ident,
+            };
+            let name = ident.to_string();
+            if name.starts_with("__mt") || name.starts_with("__Mt") {
+                return Err(syn::Error::new(
+                    ident.span(),
+                    "generic names starting with __mt or __Mt are reserved",
+                ));
             }
-            let mut seen = HashSet::new();
-            let mut result = Vec::new();
-            for field in selected {
-                if !seen.insert(field.unraw().to_string()) {
-                    return Err(syn::Error::new(field.span(), "duplicate field in index"));
-                }
-                let definition = fields
-                    .named
-                    .iter()
-                    .find(|definition| definition.ident.as_ref() == Some(&field))
-                    .ok_or_else(|| syn::Error::new(field.span(), "unknown field in index"))?;
-                result.push((field, definition.ty.clone()));
-            }
-            IndexKey::Fields(result)
         }
-        (None, Some(ty), Some(expression)) => IndexKey::Computed {
-            ty: Box::new(ty),
-            expression: Box::new(expression),
-        },
-        _ => {
+        let mut append_only = false;
+        let mut hasher = syn::parse_quote!(::std::collections::hash_map::RandomState);
+        if let Some(attr) = take_attribute(&mut table.attrs, "table")? {
+            let mut seen = HashSet::new();
+            attr.parse_nested_meta(|meta| {
+                let name = meta
+                    .path
+                    .get_ident()
+                    .ok_or_else(|| meta.error("expected a table option"))?
+                    .to_string();
+                if !seen.insert(name.clone()) {
+                    return Err(meta.error("duplicate table option"));
+                }
+                match name.as_str() {
+                    "append_only" => {
+                        append_only = true;
+                        Ok(())
+                    }
+                    "hasher" => {
+                        hasher = meta.value()?.parse()?;
+                        Ok(())
+                    }
+                    _ => Err(meta.error("expected append_only or hasher = Type")),
+                }
+            })?;
+        }
+        let syn::Fields::Unnamed(fields) = &table.fields else {
             return Err(syn::Error::new(
-                attr.span(),
-                "specify either fields(...) or both key_type = Type and key = function_or_closure",
+                table.span(),
+                "expected struct Table([Row]);",
+            ));
+        };
+        if fields.unnamed.len() != 1 {
+            return Err(syn::Error::new(
+                fields.span(),
+                "table requires exactly one [Row] field",
             ));
         }
-    };
-    let cached = options
-        .mode
-        .cached
-        .unwrap_or(matches!(key, IndexKey::Computed { .. }));
-    Ok(Index {
-        lookup_name: name.clone(),
-        name,
-        kind,
-        key,
-        cached,
-    })
+        let field = &fields.unnamed[0];
+        if !field.attrs.is_empty() || !matches!(field.vis, syn::Visibility::Inherited) {
+            return Err(syn::Error::new(
+                field.span(),
+                "table row field cannot have attributes or visibility",
+            ));
+        }
+        let syn::Type::Slice(slice) = &field.ty else {
+            return Err(syn::Error::new(field.ty.span(), "expected [Row]"));
+        };
+        let row = (*slice.elem).clone();
+        let mut id = None;
+        let mut indexes = Vec::new();
+        let mut names = HashSet::new();
+        while !input.is_empty() {
+            let item: syn::Item = input.parse()?;
+            match item {
+                syn::Item::Struct(mut item) => {
+                    let attr = take_attribute(&mut item.attrs, "id")?.ok_or_else(|| {
+                        syn::Error::new(item.span(), "ID declaration requires #[id]")
+                    })?;
+                    if !matches!(attr.meta, syn::Meta::Path(_)) {
+                        return Err(syn::Error::new(attr.span(), "#[id] has no options"));
+                    }
+                    if id.is_some() {
+                        return Err(syn::Error::new(item.span(), "duplicate ID declaration"));
+                    }
+                    if !indexes.is_empty() {
+                        return Err(syn::Error::new(
+                            item.span(),
+                            "declare the ID before index extractors",
+                        ));
+                    }
+                    validate_id(&item)?;
+                    id = Some(item);
+                }
+                syn::Item::Fn(mut function) => {
+                    let attr = take_attribute(&mut function.attrs, "index")?.ok_or_else(|| {
+                        syn::Error::new(function.span(), "extractor requires #[index(unique|many)]")
+                    })?;
+                    let mut kind = None;
+                    let mut cached = false;
+                    let mut optional = false;
+                    let mut seen = HashSet::new();
+                    attr.parse_nested_meta(|meta| {
+                        let name = meta
+                            .path
+                            .get_ident()
+                            .ok_or_else(|| meta.error("expected an index option"))?
+                            .to_string();
+                        if !seen.insert(name.clone()) {
+                            return Err(meta.error("duplicate index option"));
+                        }
+                        match name.as_str() {
+                            "unique" | "many" => {
+                                if kind.is_some() {
+                                    return Err(meta.error("choose either unique or many"));
+                                }
+                                kind = Some(if name == "unique" {
+                                    Kind::Unique
+                                } else {
+                                    Kind::Many
+                                });
+                                Ok(())
+                            }
+                            "cached" => {
+                                cached = true;
+                                Ok(())
+                            }
+                            "optional" => {
+                                optional = true;
+                                Ok(())
+                            }
+                            _ => Err(meta.error("expected unique, many, cached, or optional")),
+                        }
+                    })?;
+                    let kind = kind.ok_or_else(|| {
+                        syn::Error::new(attr.span(), "index requires unique or many")
+                    })?;
+                    for attr in &function.attrs {
+                        if attr.path().is_ident("cfg") || attr.path().is_ident("cfg_attr") {
+                            return Err(syn::Error::new(
+                                attr.span(),
+                                "conditional extractor attributes are not supported",
+                            ));
+                        }
+                    }
+                    validate_function(&function, &row)?;
+                    let name = function.sig.ident.unraw().to_string();
+                    if name.starts_with("__")
+                        || [
+                            "new", "default", "len", "is_empty", "next_id", "get", "contains",
+                            "iter", "insert", "replace", "remove", "clone", "fmt",
+                        ]
+                        .contains(&name.as_str())
+                    {
+                        return Err(syn::Error::new(
+                            function.sig.ident.span(),
+                            "extractor name conflicts with a generated table method",
+                        ));
+                    }
+                    if !names.insert(name) {
+                        return Err(syn::Error::new(
+                            function.sig.ident.span(),
+                            "duplicate index name",
+                        ));
+                    }
+                    let syn::ReturnType::Type(_, output) = &function.sig.output else {
+                        unreachable!()
+                    };
+                    let key = if optional {
+                        option_inner(output)?.clone()
+                    } else {
+                        (**output).clone()
+                    };
+                    if cached && has_input_borrow(&key, &function.sig) {
+                        return Err(syn::Error::new(
+                            key.span(),
+                            "cached keys cannot borrow the temporary row input; use an owned key or an explicit external lifetime",
+                        ));
+                    }
+                    indexes.push(Index {
+                        function,
+                        kind,
+                        cached,
+                        optional,
+                        key,
+                    });
+                }
+                item => {
+                    return Err(syn::Error::new(
+                        item.span(),
+                        "expected #[id] struct or #[index(...)] fn extractor",
+                    ));
+                }
+            }
+        }
+        let lookup_names: HashSet<_> = indexes
+            .iter()
+            .map(|index| {
+                let prefix = if matches!(index.kind, Kind::Unique) {
+                    "get"
+                } else {
+                    "iter"
+                };
+                format!("{prefix}_by_{}", index.function.sig.ident.unraw())
+            })
+            .collect();
+        for index in &indexes {
+            if lookup_names.contains(&index.function.sig.ident.unraw().to_string()) {
+                return Err(syn::Error::new(
+                    index.function.sig.ident.span(),
+                    "extractor name conflicts with a generated lookup method",
+                ));
+            }
+        }
+        if let Some(id) = &id
+            && id.ident == table.ident
+        {
+            return Err(syn::Error::new(
+                id.ident.span(),
+                "table and ID names must differ",
+            ));
+        }
+        Ok(Self {
+            table,
+            row,
+            id,
+            indexes,
+            append_only,
+            hasher,
+        })
+    }
 }
 
-// Only propagate conditional compilation, not derives or representation attributes.
-// cfg_attr can mix both, and can nest other cfg_attr attributes.
+fn option_inner(ty: &syn::Type) -> syn::Result<&syn::Type> {
+    if let syn::Type::Path(path) = ty
+        && let Some(last) = path.path.segments.last()
+        && last.ident == "Option"
+        && let syn::PathArguments::AngleBracketed(args) = &last.arguments
+        && args.args.len() == 1
+        && let syn::GenericArgument::Type(ty) = &args.args[0]
+    {
+        return Ok(ty);
+    }
+    Err(syn::Error::new(
+        ty.span(),
+        "optional index must return Option<Key>",
+    ))
+}
+
+fn validate_function(function: &syn::ItemFn, row: &syn::Type) -> syn::Result<()> {
+    let sig = &function.sig;
+    if !sig.generics.params.is_empty() || sig.generics.where_clause.is_some() {
+        return Err(syn::Error::new(
+            sig.generics.span(),
+            "extractors share table generics and cannot declare their own generics or where clause",
+        ));
+    }
+    if sig.asyncness.is_some()
+        || sig.constness.is_some()
+        || sig.unsafety.is_some()
+        || sig.abi.is_some()
+        || sig.variadic.is_some()
+    {
+        return Err(syn::Error::new(
+            sig.span(),
+            "extractor must be an ordinary safe function",
+        ));
+    }
+    if sig.inputs.len() != 1 {
+        return Err(syn::Error::new(
+            sig.inputs.span(),
+            "extractor requires exactly one argument: row: &Row",
+        ));
+    }
+    let syn::FnArg::Typed(arg) = &sig.inputs[0] else {
+        return Err(syn::Error::new(
+            sig.inputs.span(),
+            "extractor cannot have a receiver",
+        ));
+    };
+    let syn::Type::Reference(reference) = &*arg.ty else {
+        return Err(syn::Error::new(
+            arg.ty.span(),
+            "extractor argument must be &Row",
+        ));
+    };
+    if reference.mutability.is_some()
+        || quote!(#row).to_string() != {
+            let ty = &reference.elem;
+            quote!(#ty).to_string()
+        }
+    {
+        return Err(syn::Error::new(
+            arg.ty.span(),
+            "extractor argument must be an immutable reference to the declared row type",
+        ));
+    }
+    if matches!(sig.output, syn::ReturnType::Default) {
+        return Err(syn::Error::new(
+            sig.span(),
+            "extractor requires an explicit key return type",
+        ));
+    }
+    Ok(())
+}
+
+fn has_input_borrow(ty: &syn::Type, sig: &syn::Signature) -> bool {
+    use syn::visit_mut::VisitMut;
+    struct Check {
+        found: bool,
+        input: Option<syn::Lifetime>,
+    }
+    impl VisitMut for Check {
+        fn visit_type_reference_mut(&mut self, node: &mut syn::TypeReference) {
+            if node.lifetime.is_none()
+                || node
+                    .lifetime
+                    .as_ref()
+                    .is_some_and(|lt| lt.ident == "_" || Some(lt) == self.input.as_ref())
+            {
+                self.found = true;
+            }
+            syn::visit_mut::visit_type_reference_mut(self, node);
+        }
+        fn visit_lifetime_mut(&mut self, lifetime: &mut syn::Lifetime) {
+            if lifetime.ident == "_" || Some(&*lifetime) == self.input.as_ref() {
+                self.found = true;
+            }
+        }
+    }
+    let input = match &sig.inputs[0] {
+        syn::FnArg::Typed(arg) => match &*arg.ty {
+            syn::Type::Reference(r) => r.lifetime.clone(),
+            _ => None,
+        },
+        _ => None,
+    };
+    let mut check = Check {
+        found: false,
+        input,
+    };
+    check.visit_type_mut(&mut ty.clone());
+    check.found
+}
+
+fn validate_id(item: &syn::ItemStruct) -> syn::Result<()> {
+    if !item.generics.params.is_empty() || item.generics.where_clause.is_some() {
+        return Err(syn::Error::new(
+            item.generics.span(),
+            "ID cannot have generics",
+        ));
+    }
+    let syn::Fields::Unnamed(fields) = &item.fields else {
+        return Err(syn::Error::new(
+            item.span(),
+            "expected struct Id(u8|u16|u32|usize);",
+        ));
+    };
+    if fields.unnamed.len() != 1 {
+        return Err(syn::Error::new(
+            fields.span(),
+            "ID requires one unsigned integer field",
+        ));
+    }
+    let field = &fields.unnamed[0];
+    if !matches!(field.vis, syn::Visibility::Inherited) || !field.attrs.is_empty() {
+        return Err(syn::Error::new(
+            field.span(),
+            "ID backing field must be private and have no attributes",
+        ));
+    }
+    let syn::Type::Path(path) = &field.ty else {
+        return Err(syn::Error::new(
+            field.ty.span(),
+            "ID must use u8, u16, u32, or usize",
+        ));
+    };
+    if !["u8", "u16", "u32", "usize"]
+        .iter()
+        .any(|name| path.path.is_ident(name))
+    {
+        return Err(syn::Error::new(
+            field.ty.span(),
+            "ID must use u8, u16, u32, or usize",
+        ));
+    }
+    Ok(())
+}
+
+fn id_definition(item: &syn::ItemStruct, cfg: &[Tokens]) -> Tokens {
+    let name = &item.ident;
+    let vis = &item.vis;
+    let attrs: Vec<_> = item
+        .attrs
+        .iter()
+        .filter(|attr| !attr.path().is_ident("derive"))
+        .collect();
+    let syn::Fields::Unnamed(fields) = &item.fields else {
+        unreachable!()
+    };
+    let primitive = &fields.unnamed[0].ty;
+    let nonzero = match quote!(#primitive).to_string().as_str() {
+        "u8" => quote!(::std::num::NonZeroU8),
+        "u16" => quote!(::std::num::NonZeroU16),
+        "u32" => quote!(::std::num::NonZeroU32),
+        _ => quote!(::std::num::NonZeroUsize),
+    };
+    quote! {
+        #(#cfg)*
+        const _: () = assert!(::std::mem::size_of::<#primitive>() <= ::std::mem::size_of::<usize>(), "ID width exceeds target pointer width");
+        #(#cfg)* #(#attrs)*
+        #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+        #vis struct #name(#nonzero);
+        #(#cfg)*
+        impl #name {
+            #vis fn new(index: usize) -> Self { Self::try_new(index).expect("table capacity exhausted") }
+            #vis fn try_new(index: usize) -> ::std::option::Option<Self> {
+                let encoded = index.checked_add(1)?;
+                let encoded = <#primitive as ::std::convert::TryFrom<usize>>::try_from(encoded).ok()?;
+                #nonzero::new(encoded).map(Self)
+            }
+            #vis fn index(self) -> usize { (self.0.get() as usize) - 1 }
+        }
+        #(#cfg)*
+        impl ::std::convert::TryFrom<usize> for #name {
+            type Error = &'static str;
+            fn try_from(index: usize) -> ::std::result::Result<Self, Self::Error> { Self::try_new(index).ok_or("table capacity exhausted") }
+        }
+        #(#cfg)*
+        impl ::std::convert::From<#name> for usize { fn from(id: #name) -> usize { id.index() } }
+    }
+}
+
+// Retain conditional compilation on all generated items, without carrying derives.
 fn conditional_meta(meta: &syn::Meta) -> syn::Result<Option<syn::Meta>> {
     if meta.path().is_ident("cfg") {
         return Ok(Some(meta.clone()));
@@ -185,594 +509,250 @@ fn conditional_meta(meta: &syn::Meta) -> syn::Result<Option<syn::Meta>> {
     if !meta.path().is_ident("cfg_attr") {
         return Ok(None);
     }
-    let syn::Meta::List(list) = meta else {
-        return Err(syn::Error::new(meta.span(), "expected cfg_attr arguments"));
-    };
-    let arguments = list.parse_args_with(
+    let list = meta.require_list()?;
+    let args = list.parse_args_with(
         syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
     )?;
-    let mut arguments = arguments.iter();
-    let predicate = arguments
+    let mut args = args.iter();
+    let predicate = args
         .next()
         .ok_or_else(|| syn::Error::new(meta.span(), "expected cfg_attr predicate"))?;
-    let mut attributes = Vec::new();
-    for argument in arguments {
-        if let Some(attribute) = conditional_meta(argument)? {
-            attributes.push(attribute);
-        }
-    }
-    if attributes.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(
-        syn::parse_quote!(cfg_attr(#predicate, #(#attributes),*)),
-    ))
+    let attrs = args
+        .map(conditional_meta)
+        .collect::<syn::Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    Ok((!attrs.is_empty()).then(|| syn::parse_quote!(cfg_attr(#predicate, #(#attrs),*))))
 }
 
-fn expand(args: TokenStream2, mut row: ItemStruct) -> syn::Result<TokenStream2> {
-    let name = row.ident.clone();
-    let vis = &row.vis;
-    let options: TableOptions = attributes::parse(args)?;
-    let append_only = options.append_only;
-    let hasher: syn::Type = options
-        .hasher
-        .unwrap_or_else(|| syn::parse_quote!(::std::collections::hash_map::RandomState));
-    let table = options
-        .table
-        .unwrap_or_else(|| format_ident!("{}Table", name.unraw()));
-    if table == name {
-        return Err(syn::Error::new(
-            name.span(),
-            "row and table names must be distinct",
-        ));
+// Strip only the traits generated by this macro. Preserve other attributes,
+// including nested cfg_attr layout and lint attributes, on the table itself.
+fn table_meta(meta: &syn::Meta) -> syn::Result<Option<syn::Meta>> {
+    if meta.path().is_ident("cfg") {
+        return Ok(None);
     }
-    let (id, id_from_index, id_to_index) =
-        match (options.id, options.id_from_index, options.id_to_index) {
-            (None, None, None) => (
-                syn::parse_quote!(usize),
-                quote!(|index| index),
-                quote!(|id| id),
-            ),
-            (Some(id), Some(from), Some(to)) => (id, quote!(#from), quote!(#to)),
-            _ => {
-                return Err(syn::Error::new(
-                    name.span(),
-                    "specify id, id_from_index, and id_to_index together",
-                ));
-            }
-        };
-    let Fields::Named(fields) = &mut row.fields else {
-        return Err(syn::Error::new(
-            row.span(),
-            "table requires a named-field struct",
-        ));
-    };
-    let mut indexes = Vec::new();
-    for field in &mut fields.named {
-        let mut kind = None;
-        let mut cached = false;
-        let mut retained = Vec::new();
-        for attr in std::mem::take(&mut field.attrs) {
-            if attr.path().is_ident("indexed") {
-                if kind.is_some() {
-                    return Err(syn::Error::new(attr.span(), "duplicate indexed attribute"));
-                }
-                let mode: IndexMode = attributes::parse_attribute(&attr)?;
-                kind = Some(mode.kind(attr.span())?);
-                cached = mode.cached.unwrap_or(false);
-            } else {
-                if attr.path().is_ident("cfg") || attr.path().is_ident("cfg_attr") {
-                    return Err(syn::Error::new(
-                        attr.span(),
-                        "conditionally compiled fields are not supported",
-                    ));
-                }
-                retained.push(attr);
-            }
-        }
-        field.attrs = retained;
-        if let Some(kind) = kind {
-            let field_name = field.ident.clone().unwrap();
-            indexes.push(Index {
-                name: field_name.clone(),
-                lookup_name: field_name.clone(),
-                kind,
-                key: IndexKey::Fields(vec![(field_name, field.ty.clone())]),
-                cached,
-            });
-        }
+    if meta.path().is_ident("derive") {
+        let paths = meta.require_list()?.parse_args_with(
+            syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
+        )?;
+        let paths = paths
+            .into_iter()
+            .filter(|path| {
+                !path
+                    .segments
+                    .last()
+                    .is_some_and(|segment| segment.ident == "Debug" || segment.ident == "Clone")
+            })
+            .collect::<Vec<_>>();
+        return Ok((!paths.is_empty()).then(|| syn::parse_quote!(derive(#(#paths),*))));
     }
-    let mut retained = Vec::new();
-    for attr in std::mem::take(&mut row.attrs) {
-        if attr.path().is_ident("index") {
-            indexes.push(parse_index(&attr, fields)?);
-        } else {
-            retained.push(attr);
-        }
+    if meta.path().is_ident("cfg_attr") {
+        let args = meta.require_list()?.parse_args_with(
+            syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+        )?;
+        let mut args = args.iter();
+        let predicate = args
+            .next()
+            .ok_or_else(|| syn::Error::new(meta.span(), "expected cfg_attr predicate"))?;
+        let attrs = args
+            .map(table_meta)
+            .collect::<syn::Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        return Ok(
+            (!attrs.is_empty()).then(|| syn::parse_quote!(cfg_attr(#predicate, #(#attrs),*)))
+        );
     }
-    row.attrs = retained;
-    let mut index_names = HashSet::new();
-    for index in &indexes {
-        if !index_names.insert(index.name.unraw().to_string()) {
-            return Err(syn::Error::new(index.name.span(), "duplicate index name"));
-        }
-    }
+    Ok(Some(meta.clone()))
+}
+
+fn expand(declaration: Declaration) -> syn::Result<Tokens> {
+    let Declaration {
+        table,
+        row,
+        id: id_item,
+        indexes,
+        append_only,
+        hasher,
+    } = declaration;
+    let name = &table.ident;
+    let vis = &table.vis;
     let runtime = match proc_macro_crate::crate_name("microtable") {
         Ok(proc_macro_crate::FoundCrate::Itself) => quote!(::microtable),
         Ok(proc_macro_crate::FoundCrate::Name(name)) => {
             let ident = format_ident!("{}", name);
             quote!(::#ident)
         }
-        Err(err) => return Err(syn::Error::new(name.span(), err.to_string())),
+        Err(error) => return Err(syn::Error::new(name.span(), error.to_string())),
     };
-    let entry = format_ident!("__{}Entry", table.unraw());
-    let mut cfg = Vec::new();
-    for attr in &row.attrs {
-        if let Some(meta) = conditional_meta(&attr.meta)? {
-            cfg.push(quote!(#[#meta]));
-        }
-    }
-    let original_generics = &row.generics;
-    let (_, row_args, row_where) = original_generics.split_for_impl();
-    let mut table_generics = row.generics.clone();
-    table_generics
-        .make_where_clause()
-        .predicates
-        .push(syn::parse_quote!(
-            #hasher: ::std::hash::BuildHasher + ::std::clone::Clone + ::std::default::Default
-        ));
-    table_generics
-        .make_where_clause()
-        .predicates
-        .push(syn::parse_quote!(
-            #id: ::std::marker::Copy + ::std::cmp::Eq
-        ));
+    let cfg = table
+        .attrs
+        .iter()
+        .map(|attr| conditional_meta(&attr.meta))
+        .collect::<syn::Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .map(|meta| quote!(#[#meta]))
+        .collect::<Vec<_>>();
+    let id: syn::Type = id_item
+        .as_ref()
+        .map(|item| {
+            let name = &item.ident;
+            syn::parse_quote!(#name)
+        })
+        .unwrap_or_else(|| syn::parse_quote!(usize));
+    let id_def = id_item.as_ref().map(|item| id_definition(item, &cfg));
+    let (from, to) = if id_item.is_some() {
+        (quote!(#id::new), quote!(#id::index))
+    } else {
+        (quote!(|index| index), quote!(|id| id))
+    };
+    let mut generics = table.generics.clone();
+    generics.make_where_clause().predicates.push(syn::parse_quote!(#hasher: ::std::hash::BuildHasher + ::std::clone::Clone + ::std::default::Default));
     for index in &indexes {
-        for ty in index.types() {
-            let clone_bound = (index.cached && matches!(index.key, IndexKey::Fields(_)))
-                .then(|| quote!(::std::clone::Clone+));
-            table_generics
-                .make_where_clause()
-                .predicates
-                .push(syn::parse_quote!(
-                    #ty: #clone_bound ::std::cmp::Eq + ::std::hash::Hash
-                ));
-        }
+        // Borrowed outputs are local values, never fields. Bound their referents
+        // rather than adding a higher-ranked bound that would require Row: 'static.
+        indexes::add_key_bounds(&mut generics, &index.key);
     }
-    let (impl_generics, type_generics, table_where) = table_generics.split_for_impl();
-    let indexes::Code {
-        map_fields,
-        map_defaults,
-        entry_fields,
-        entry_defaults,
-        prepare,
-        checks_insert,
-        checks_replace,
-        reserve,
-        groups_insert,
-        keys_insert,
-        keys_replace,
-        detach_replace,
-        detach_remove,
-        commit,
-        lookups,
-    } = indexes::Code::generate(
-        &indexes,
-        &indexes::Context {
-            runtime: &runtime,
-            name: &name,
-            row_args: quote!(#row_args),
-            id: &id,
-            hasher: &hasher,
-            vis,
-            append_only,
-            variant: None,
-        },
-    );
+    let (ig, args, wc) = generics.split_for_impl();
+    let entry = format_ident!("__{}Entry", name.unraw());
     let arena = if append_only {
         quote!(#runtime::__private::AppendArena)
     } else {
         quote!(#runtime::__private::Arena)
     };
-    let next_id = append_only.then(|| quote!(let id = self.__rows.next_id();));
-    let capacity_check = quote! {
-        ::std::assert!(self.__rows.can_insert(), "table capacity exhausted");
-        #next_id
-    };
+    let code = indexes::generate(
+        &indexes,
+        &indexes::Context {
+            row: &row,
+            id: &id,
+            hasher: &hasher,
+            vis,
+            runtime: &runtime,
+            append_only,
+            generics: &generics,
+            table: name,
+        },
+    );
+    let indexes::Code {
+        map_fields,
+        map_defaults,
+        entry_fields,
+        entry_defaults,
+        helpers,
+        prepare,
+        checks_insert,
+        checks_replace,
+        reserve,
+        detach,
+        commit,
+        lookups,
+        iterators,
+    } = code;
+    let clone = traits::enabled(&table.attrs, "Clone")?;
+    let debug = traits::enabled(&table.attrs, "Debug")?;
+    let entry_def = traits::with_clone(
+        quote! {
+            #(#cfg)* struct #entry #generics #wc { row: #row, #(#entry_fields,)* }
+        },
+        &clone,
+    );
+    let attrs = table
+        .attrs
+        .iter()
+        .map(|attr| table_meta(&attr.meta))
+        .collect::<syn::Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .map(|meta| quote!(#[#meta]))
+        .collect::<Vec<_>>();
+    let table_def = traits::with_clone(
+        quote! {
+            #(#cfg)* #(#attrs)* #vis struct #name #generics #wc {
+                __rows: #arena<#entry #args, #id>, __hasher: #hasher, #(#map_fields,)*
+            }
+        },
+        &clone,
+    );
+    let debug_impl = traits::debug_impl(name, &generics, quote!(#row), &id, &cfg, &debug);
+    let release = indexes
+        .iter()
+        .filter(|index| !index.cached)
+        .map(|index| {
+            let key = format_ident!("__key_{}", index.function.sig.ident.unraw());
+            quote!(#[allow(dropping_copy_types, clippy::drop_non_drop)] ::std::mem::drop(#key);)
+        })
+        .collect::<Vec<_>>();
     let reserve_rows = append_only.then(|| quote!(self.__rows.reserve(1);));
     let insert_row = if append_only {
         quote!(self.__rows.push(entry);)
     } else {
-        quote!(let id = self.__rows.insert(entry);)
+        quote!(let __actual_id = self.__rows.insert(entry); debug_assert!(__actual_id == id);)
     };
     let mutations = (!append_only).then(|| quote! {
-        /// Replace a row without changing its ID, returning the previous row.
-        /// Constraint failures leave the table unchanged and return the rejected row.
-        #vis fn replace(&mut self, id: #id, row: #name #row_args) -> ::std::result::Result<#name #row_args, #runtime::ReplaceError<#name #row_args>> {
-            if !self.contains(id) {
-                return ::std::result::Result::Err(#runtime::ReplaceError { row, kind: #runtime::ReplaceErrorKind::NotFound });
-            }
+        #vis fn replace(&mut self, id: #id, row: #row) -> ::std::result::Result<#row, #runtime::ReplaceError<#row>> {
+            if !self.contains(id) { return ::std::result::Result::Err(#runtime::ReplaceError { row, kind: #runtime::ReplaceErrorKind::NotFound }); }
             #(#prepare)*
-            #(#checks_replace)*
-            #(#keys_replace)*
-            #(#reserve)*
-            #(#detach_replace)*
+            let __conflict = (|| { #(#checks_replace)* ::std::option::Option::None })();
+            #(#release)*
+            if let ::std::option::Option::Some(kind) = __conflict { return ::std::result::Result::Err(#runtime::ReplaceError { row, kind }); }
+            #(#reserve)* #(#detach)*
             let entry = #entry { row, #(#entry_defaults,)* };
             let old = ::std::mem::replace(self.__rows.get_mut(id).expect("present row"), entry);
             #(#commit)*
             ::std::result::Result::Ok(old.row)
         }
-        /// Remove a row and its index entries. Other row IDs remain unchanged.
-        #vis fn remove(&mut self, id: #id) -> ::std::option::Option<#name #row_args> {
-            if !self.contains(id) {
-                return ::std::option::Option::None;
-            }
-            #(#detach_remove)*
-            self.__rows.remove(id).map(|entry| entry.row)
+        #vis fn remove(&mut self, id: #id) -> ::std::option::Option<#row> {
+            if !self.contains(id) { return ::std::option::Option::None; }
+            #(#detach)* self.__rows.remove(id).map(|entry| entry.row)
         }
     });
-    let table_doc = if append_only {
-        "An append-only table with stable row IDs and generated indexes."
-    } else {
-        "A table with stable row IDs and generated indexes. Mutation is through checked replacement."
-    };
-    let get_doc = if append_only {
-        "Get a row by ID. IDs remain valid for the lifetime of the table."
-    } else {
-        "Get a row by ID. Removed IDs can refer to rows inserted into reused slots."
-    };
-    let clone_enabled = traits::enabled(&row.attrs, "Clone")?;
-    let debug_enabled = traits::enabled(&row.attrs, "Debug")?;
-    let entry_definition = traits::with_clone(
-        quote! {
-            #(#cfg)*
-            struct #entry #original_generics #row_where {
-                row: #name #row_args,
-                #(#entry_fields,)*
-            }
-        },
-        &clone_enabled,
-    );
-    let table_definition = traits::with_clone(
-        quote! {
-            #(#cfg)*
-            #[doc = #table_doc]
-            #vis struct #table #table_generics #table_where {
-                __rows: #arena<#entry #row_args, #id>,
-                __hasher: #hasher,
-                #(#map_fields,)*
-            }
-        },
-        &clone_enabled,
-    );
-    let debug_impl = traits::debug_impl(
-        &table,
-        &table_generics,
-        quote!(#name #row_args),
-        &id,
-        &cfg,
-        &debug_enabled,
-    );
+    let iterators = iterators
+        .into_iter()
+        .map(|tokens| {
+            let file: syn::File = syn::parse2(tokens).expect("generated iterators");
+            let items = file
+                .items
+                .into_iter()
+                .map(|item| quote!(#(#cfg)* #item))
+                .collect::<Vec<_>>();
+            quote!(#(#items)*)
+        })
+        .collect::<Vec<_>>();
     Ok(quote! {
-        #row
-        #entry_definition
-        #table_definition
-        #debug_impl
-
-        #(#cfg)*
-        impl #impl_generics ::std::default::Default for #table #type_generics #table_where {
+        #id_def #entry_def #table_def #debug_impl
+        #(#iterators)*
+        #(#cfg)* impl #ig ::std::default::Default for #name #args #wc {
             fn default() -> Self {
                 let __hasher: #hasher = ::std::default::Default::default();
-                Self {
-                    __rows: #arena::new(#id_from_index, #id_to_index),
-                    #(#map_defaults,)*
-                    __hasher,
-                }
+                Self { __rows: #arena::new(#from, #to), #(#map_defaults,)* __hasher }
             }
         }
-
-        #(#cfg)*
-        impl #impl_generics #table #type_generics #table_where {
-            /// Create an empty table.
+        #(#cfg)* impl #ig #name #args #wc {
             #vis fn new() -> Self { ::std::default::Default::default() }
-            /// Number of live rows.
             #vis fn len(&self) -> usize { self.__rows.len() }
-            /// Whether the table contains no rows.
             #vis fn is_empty(&self) -> bool { self.len() == 0 }
-            /// The ID of the next successful insertion. Does not reserve the ID.
-            /// Rejected insertions do not change this value.
-            /// Panics if row storage capacity is exhausted.
             #vis fn next_id(&self) -> #id {
-                ::std::assert!(self.__rows.can_insert(), "table capacity exhausted");
+                assert!(self.__rows.can_insert(), "table capacity exhausted");
                 self.__rows.next_id()
             }
-            #[doc = #get_doc]
-            #vis fn get(&self, id: #id) -> ::std::option::Option<&#name #row_args> {
-                self.__rows.get(id).map(|entry| &entry.row)
-            }
-            /// Whether this ID currently identifies a row.
+            #vis fn get(&self, id: #id) -> ::std::option::Option<&#row> { self.__rows.get(id).map(|entry| &entry.row) }
             #vis fn contains(&self, id: #id) -> bool { self.get(id).is_some() }
-            /// Iterate over live rows in unspecified order. Cost is proportional to allocated slots.
-            #vis fn iter(&self) -> impl ::std::iter::Iterator<Item = (#id, &#name #row_args)> + '_ {
-                self.__rows.iter().map(|(id, entry)| (id, &entry.row))
-            }
-            /// Insert a row, returning its ID or the rejected row and first conflicting ID.
-            /// Unique conflicts leave the table unchanged.
-            /// Panics if row storage capacity is exhausted.
-            #vis fn insert(&mut self, row: #name #row_args) -> ::std::result::Result<#id, (#name #row_args, #id)> {
+            #vis fn iter(&self) -> impl ::std::iter::Iterator<Item = (#id, &#row)> + '_ { self.__rows.iter().map(|(id, entry)| (id, &entry.row)) }
+            #vis fn insert(&mut self, row: #row) -> ::std::result::Result<#id, (#row, #id)> {
                 #(#prepare)*
-                #(#checks_insert)*
-                #capacity_check
-                #(#groups_insert)*
-                #(#keys_insert)*
-                #reserve_rows
-                #(#reserve)*
+                let __conflict = (|| { #(#checks_insert)* ::std::option::Option::None })();
+                #(#release)*
+                if let ::std::option::Option::Some(existing) = __conflict { return ::std::result::Result::Err((row, existing)); }
+                // next_id converts before any reservation or index mutation.
+                let id = self.next_id();
+                #reserve_rows #(#reserve)*
                 let entry = #entry { row, #(#entry_defaults,)* };
-                #insert_row
-                #(#commit)*
-                ::std::result::Result::Ok(id)
+                #insert_row #(#commit)* ::std::result::Result::Ok(id)
             }
-            #mutations
-            #(#lookups)*
+            #mutations #(#helpers)* #(#lookups)*
         }
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn invalid_declarations_have_diagnostics() {
-        for (args, item, message) in [
-            (
-                quote!(),
-                quote!(
-                    struct Row(u32);
-                ),
-                "named-field",
-            ),
-            (
-                quote!(),
-                quote!(
-                    struct Row {
-                        #[indexed(wrong)]
-                        key: u32,
-                    }
-                ),
-                "Unknown field: `wrong`",
-            ),
-            (
-                quote!(),
-                quote!(
-                    struct Row {
-                        #[indexed(unique)]
-                        #[indexed(many)]
-                        key: u32,
-                    }
-                ),
-                "duplicate indexed",
-            ),
-            (
-                quote!(index_type = bool),
-                quote!(
-                    struct Row {}
-                ),
-                "Unknown field: `index_type`",
-            ),
-            (
-                quote!(table = First, table = Second),
-                quote!(
-                    struct Row {}
-                ),
-                "Duplicate field `table`",
-            ),
-            (
-                quote!(unknown = true),
-                quote!(
-                    struct Row {}
-                ),
-                "Unknown field: `unknown`",
-            ),
-            (
-                quote!(),
-                quote!(
-                    #[index(unique, fields(a))]
-                    struct Row {
-                        a: u32,
-                    }
-                ),
-                "Missing field `name`",
-            ),
-            (
-                quote!(),
-                quote!(
-                    #[index(name = pair, fields(a))]
-                    struct Row {
-                        a: u32,
-                    }
-                ),
-                "requires unique or many",
-            ),
-            (
-                quote!(),
-                quote!(
-                    #[index(name = pair, unique, many, fields(a))]
-                    struct Row {
-                        a: u32,
-                    }
-                ),
-                "either unique or many",
-            ),
-            (
-                quote!(),
-                quote!(
-                    #[index(name = pair, unique, fields())]
-                    struct Row {}
-                ),
-                "must not be empty",
-            ),
-            (
-                quote!(),
-                quote!(
-                    #[index(name = pair, unique, fields(missing))]
-                    struct Row {
-                        a: u32,
-                    }
-                ),
-                "unknown field",
-            ),
-            (
-                quote!(),
-                quote!(
-                    #[index(name = pair, unique, fields(a, a))]
-                    struct Row {
-                        a: u32,
-                    }
-                ),
-                "duplicate field",
-            ),
-            (
-                quote!(),
-                quote!(
-                    #[index(name = pair, unique, key = compute)]
-                    struct Row {}
-                ),
-                "both key_type",
-            ),
-            (
-                quote!(),
-                quote!(
-                    #[index(name = pair, unique, fields(a), key_type = u32, key = compute)]
-                    struct Row {
-                        a: u32,
-                    }
-                ),
-                "either fields",
-            ),
-            (
-                quote!(),
-                quote!(
-                    #[index(name = a, many, fields(a))]
-                    struct Row {
-                        #[indexed(unique)]
-                        a: u32,
-                    }
-                ),
-                "duplicate index name",
-            ),
-            (
-                quote!(),
-                quote!(
-                    #[index(name = a, name = b, unique, fields(a))]
-                    struct Row {
-                        a: u32,
-                    }
-                ),
-                "Duplicate field `name`",
-            ),
-            (
-                quote!(),
-                quote!(
-                    #[index(name = a, unique, unknown)]
-                    struct Row {
-                        a: u32,
-                    }
-                ),
-                "Unknown field: `unknown`",
-            ),
-        ] {
-            let error = expand(args, syn::parse2(item).unwrap()).unwrap_err();
-            assert!(error.to_string().contains(message), "{error}");
-        }
-        for args in [
-            quote!(id = Id),
-            quote!(id_from_index = Id::new),
-            quote!(id_to_index = Id::index),
-            quote!(id = Id, id_from_index = Id::new),
-            quote!(id = Id, id_to_index = Id::index),
-            quote!(id_from_index = Id::new, id_to_index = Id::index),
-        ] {
-            let item = syn::parse_quote!(
-                struct Row {}
-            );
-            let error = expand(args.clone(), item).unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("specify id, id_from_index, and id_to_index together")
-            );
-            let item = syn::parse_quote!(
-                enum Row {
-                    Value(()),
-                }
-            );
-            let error = enums::expand(args, item).unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("specify id, id_from_index, and id_to_index together")
-            );
-        }
-        let item = syn::parse_quote!(
-            enum Row {
-                Value(()),
-            }
-        );
-        let error = enums::expand(quote!(index_type = u8), item).unwrap_err();
-        assert!(error.to_string().contains("Unknown field: `index_type`"));
-        for item in [
-            quote!(
-                enum Row {
-                    Record { key: u32 },
-                }
-            ),
-            quote!(
-                enum Row {
-                    Unit,
-                }
-            ),
-            quote!(
-                enum Row {
-                    Empty(),
-                }
-            ),
-            quote!(
-                enum Row {
-                    Pair(u32, u32),
-                }
-            ),
-            quote!(
-                enum Row {
-                    #[index(name = key, unique, fields(key))]
-                    Value(u32),
-                }
-            ),
-            quote!(
-                enum Row {
-                    #[index(name = key, unique, key = compute)]
-                    Value(u32),
-                }
-            ),
-            quote!(
-                #[index(name = key, unique, key_type = u32, key = compute)]
-                enum Row {
-                    Value(u32),
-                }
-            ),
-            quote!(
-                enum Row {
-                    Value(#[indexed(unique)] u32),
-                }
-            ),
-            quote!(
-                enum Row {
-                    #[cfg(any())]
-                    Value(u32),
-                }
-            ),
-        ] {
-            assert!(enums::expand(quote!(), syn::parse2(item).unwrap()).is_err());
-        }
-    }
 }

@@ -1,4 +1,4 @@
-//! Trait support selected by the row's derive attributes.
+//! Trait support selected by the table's derive attributes.
 
 use proc_macro2::TokenStream;
 use quote::quote;
@@ -54,7 +54,17 @@ pub(super) fn enabled(attrs: &[syn::Attribute], name: &str) -> syn::Result<Token
 pub(super) fn with_clone(item: TokenStream, enabled: &TokenStream) -> TokenStream {
     let input: syn::DeriveInput = syn::parse2(item.clone()).expect("generated type");
     let name = &input.ident;
-    let attrs = &input.attrs;
+    // Layout, documentation, and lint attributes belong to the struct, not
+    // this implementation. Only conditional compilation must be repeated.
+    let attrs = input
+        .attrs
+        .iter()
+        .filter_map(|attr| {
+            super::conditional_meta(&attr.meta)
+                .expect("validated generated attributes")
+                .map(|meta| quote!(#[#meta]))
+        })
+        .collect::<Vec<_>>();
     let mut generics = input.generics.clone();
     let mut bound_fields = |fields: &syn::Fields| {
         for field in fields {
@@ -74,15 +84,7 @@ pub(super) fn with_clone(item: TokenStream, enabled: &TokenStream) -> TokenStrea
                 .map(|field| field.ident.as_ref().expect("named field"));
             quote!(Self { #(#fields: ::std::clone::Clone::clone(&self.#fields),)* })
         }
-        syn::Data::Enum(data) => {
-            let arms = data.variants.iter().map(|variant| {
-                bound_fields(&variant.fields);
-                let variant = &variant.ident;
-                quote!(Self::#variant(value) => Self::#variant(::std::clone::Clone::clone(value)))
-            }).collect::<Vec<_>>();
-            quote!(match self { #(#arms,)* })
-        }
-        _ => unreachable!("generated struct or enum"),
+        _ => unreachable!("generated struct"),
     };
     let (impl_generics, args, where_clause) = generics.split_for_impl();
     quote! {

@@ -1,301 +1,201 @@
 # microtable
 
-A Rust library that generates tables with stable row IDs and hash-based
-indexes. The workspace contains `microtable` (runtime storage and errors)
-and `microtable-macros` (the attribute macro, re-exported by `microtable`).
+Rust tables with stable row IDs and hash-based indexes. Declare an ordinary row
+type, then use `microtable::table!` to select its indexes and storage options.
+
+## A contact table
 
 ```rust
-#[microtable::table]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Person {
-    #[indexed(unique)]
-    email: String,
-    #[indexed(many)]
-    team: String,
     name: String,
+    email: String,
+    team: String,
 }
 
-let mut people = PersonTable::new();
-let id: usize = people.insert(Person {
+microtable::table! {
+    #[derive(Debug, Clone)]
+    pub struct People([Person]);
+
+    #[id]
+    pub struct PersonId(u32);
+
+    #[index(unique)]
+    fn email(person: &Person) -> &str {
+        &person.email
+    }
+
+    #[index(many)]
+    fn team(person: &Person) -> &str {
+        &person.team
+    }
+}
+
+let mut people = People::new();
+let id = people.insert(Person {
+    name: "Ada".into(),
     email: "ada@example.com".into(),
     team: "engineering".into(),
-    name: "Ada".into(),
 }).unwrap();
 
-assert_eq!(people.get(id).unwrap().name, "Ada");
 assert_eq!(people.get_by_email("ada@example.com").unwrap().0, id);
-for (id, person) in people.iter_by_team("engineering") {
-    println!("{id:?}: {}", person.name);
+for (_, person) in people.iter_by_team("engineering") {
+    println!("{}", person.name);
 }
+```
 
-// Replacement preserves the ID and checks all unique constraints first.
-let previous = people.replace(id, Person {
-    email: "ada@example.com".into(),
-    team: "research".into(),
-    name: "Ada".into(),
-}).unwrap();
+`unique` generates `get_by_<name>`, returning `Option<(Id, &Row)>`. `many`
+generates `iter_by_<name>`, returning an iterator of `(Id, &Row)`.
+Indexes are noncached by default and can borrow directly from the row.
+
+Rows are immutable through the table. Use `replace` to update all indexes while
+keeping the ID:
+
+```rust
+let mut updated = people.get(id).unwrap().clone();
+updated.team = "research".into();
+let previous = people.replace(id, updated).unwrap();
 assert_eq!(previous.team, "engineering");
-assert_eq!(people.iter_by_team("engineering").count(), 0);
-assert_eq!(people.iter_by_team("research").count(), 1);
-
-people.remove(id).unwrap();
-assert!(people.get(id).is_none());
+let ada = people.remove(id).unwrap();
 ```
 
-The macro preserves the original row type and its ordinary attributes. It generates
-`PersonTable` with the row type's visibility. Rows can have lifetimes,
-type parameters, const parameters, and where clauses.
+Unique conflicts leave the table unchanged. `insert` returns the rejected row
+and blocking ID as `Err((row, id))`; `replace` returns a `ReplaceError` containing
+the rejected row and a `Unique { field }` or `NotFound` reason.
 
-Configure the table and use a custom ID type with:
+Tables also provide `default`, `len`, `is_empty`, `contains`, and `iter`.
+`next_id` previews the next insertion ID without reserving it. Iteration order is
+unspecified.
+
+## Computed and composite keys
+
+A different table can index the same row type differently:
 
 ```rust
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct PersonKey(usize);
+microtable::table! {
+    struct Directory([Person]);
 
-#[microtable::table(
-    table = People,
-    id = PersonKey,
-    id_from_index = |index| PersonKey(index),
-    id_to_index = |id| id.0,
-)]
-struct Person {
-    name: String,
+    #[index(unique, cached)]
+    fn normalized_email(person: &Person) -> String {
+        person.email.to_ascii_lowercase()
+    }
+
+    #[index(unique)]
+    fn team_name(person: &Person) -> (&str, &str) {
+        (&person.team, &person.name)
+    }
 }
+
+let mut directory = Directory::new();
+directory.insert(ada).unwrap();
+assert!(directory.get_by_normalized_email("ada@example.com").is_some());
+assert!(directory.get_by_team_name(&("research", "Ada")).is_some());
 ```
 
-The table name defaults to `<Row>Table`. Row IDs default to `usize`.
-A custom ID requires both `id_from_index: fn(usize) -> Id` and
-`id_to_index: fn(Id) -> usize`. Each callback accepts a function path, such as
-`PersonKey::new`, or a non-capturing closure. The ID type must implement
-`Copy + Eq`. Both callbacks are infallible: they must be deterministic,
-nonpanicking inverses for all valid slot indices. There are no automatic
-capacity limits for narrow custom IDs. The mapping must support every slot
-index that the table uses. Slot offsets, lengths, and free-list links use `usize`;
-row references in indexes and list links use the ID type.
+`cached` stores the extracted key, so reads, removal, and rehashing do not rerun
+its computation. Cached keys cannot borrow from the temporary row reference;
+owned keys such as `String` work. Keys need `Eq + Hash`, but not `Clone` unless
+needed to clone a cached table. Tuple lookups take one tuple reference.
 
-Generated tables provide:
+## Optional indexes and enums
 
-| Method | Result |
-| --- | --- |
-| `new()`, `default()` | Empty table |
-| `len()`, `is_empty()` | Live row count |
-| `next_id()` | ID of the next successful insertion, without reserving it |
-| `insert(row)` | `Result<Id, (Row, Id)>`, returning the rejected row and blocking ID on a unique conflict |
-| `get(id)` | `Option<&Row>` |
-| `contains(id)` | Whether the ID currently exists |
-| `replace(id, row)` | `Result<Row, ReplaceError<Row>>`, returning the old row |
-| `remove(id)` | `Option<Row>` |
-| `iter()` | Iterator of `(Id, &Row)` |
-| `get_by_<field>(&key)` | `Option<(Id, &Row)>` for a unique index |
-| `iter_by_<field>(&key)` | Iterator of `(Id, &Row)` for a many index |
-
-`next_id()` does not change the table. Rejected insertions do not consume the ID;
-a removal can change it by making a slot available for reuse. The method works
-for struct and enum tables in both storage modes and panics if capacity is exhausted.
-
-Noncached indexed fields require `Eq + Hash`; cached indexed fields also require
-`Clone`. Non-indexed fields have no additional bounds. Lookups support borrowed
-keys through `Borrow`, such as a `str` lookup against a `String` field. Row access
-is immutable; change rows through `replace` in mutable tables.
-
-## Append-only tables
-
-Use `#[microtable::table(append_only)]` or `append_only = true` when rows must
-not be removed or replaced. These tables retain `insert`, read methods, full
-and indexed iteration, `new`, `default`, `len`, and `is_empty`; `remove` and
-`replace` are not generated. Index cache options and defaults and custom IDs
-work as in mutable tables.
-
-Append-only rows use a dense `Vec`, with no vacant slots or free list. Each many
-index stores one plain ID successor per row in a circular group, with a stable
-representative row ID. There are no per-row cached hashes. Group iteration
-visits each matching row once; all iteration order is unspecified.
-
-## Enum tables
-
-Every enum variant must be a single-field tuple variant, `Variant(Payload)`.
-Unit variants, record variants, and tuple variants with multiple fields are rejected.
+`optional` lets an extractor return `None` to exclude a row from an index. This
+works with structs and with any enum shape:
 
 ```rust
 #[derive(Debug)]
-struct Person { email: String }
-#[derive(Debug)]
-struct Device { kind: String }
-
-#[microtable::table]
-#[derive(Debug)]
-enum Entry {
-    #[index(name = email, unique, key_type = String,
-            key = |person| person.email.clone())]
-    Person(Person),
-    #[index(name = kind, many, key_type = String,
-            key = |device| device.kind.clone(), cached = false)]
-    Device(Device),
+enum Task {
+    Pending { assignee: String },
+    Completed,
 }
 
-let mut entries = EntryTable::new();
-let id = entries.insert(Entry::Person(Person { email: "ada@example.com".into() })).unwrap();
-entries.insert(Entry::Device(Device { kind: "sensor".into() })).unwrap();
-assert_eq!(entries.get_person_by_email("ada@example.com").unwrap().0, id);
-assert_eq!(entries.iter_device_by_kind("sensor").count(), 1);
+microtable::table! {
+    struct Tasks([Task]);
+
+    #[index(many, optional)]
+    fn assignee(task: &Task) -> Option<&str> {
+        match task {
+            Task::Pending { assignee } => Some(assignee.as_str()),
+            Task::Completed => None,
+        }
+    }
+}
+
+let mut tasks = Tasks::new();
+tasks.insert(Task::Pending { assignee: "Ada".into() }).unwrap();
+tasks.insert(Task::Completed).unwrap();
+assert_eq!(tasks.iter_by_assignee("Ada").count(), 1);
 ```
 
-Only named computed `#[index(name = ..., unique|many, key_type = Type,
-key = function_or_closure, cached = ...)]` indexes are supported on variants.
-The extractor is a function path or non-capturing closure of type
-`fn(&Payload) -> Key`, not a function of the enum. Computed indexes default to
-`cached = true`; `cached = false` is also supported. Payload indexes are not
-inherited. Field indexes, `fields(...)`, and enum-level index attributes are
-rejected.
+Combine `optional` with `unique`, `many`, or `cached`. Without `optional`, an
+`Option` return is an ordinary key: `None` participates in indexing and uniqueness.
+Enum indexes inspect the whole row; uniqueness is not limited to one variant.
 
-Index names must be distinct within a variant, but different variants can use
-the same name. Lookup methods include the snake_case variant name, such as
-`get_person_by_email` and `iter_device_by_kind`. They return `(Id, &Entry)`
-pairs through an `Option` or iterator, as in struct tables, not payload references.
-All variants share one arena and ID domain. Unique constraints apply only within
-the indexed variant. In mutable tables, `replace` can change a row's variant;
-constraints are checked before the table changes. `append_only` also works for
-enum tables and omits `replace` and `remove`.
+## IDs
 
-Generated row metadata is an enum: it stores index links and cached hashes only
-for the active variant, not for every variant.
+Without an `#[id]` declaration, IDs are `usize`. Generated IDs accept `u8`, `u16`,
+`u32`, or `usize` backing types no wider than the target's pointer width. They
+store the slot index plus one in a nonzero integer, so `Option<PersonId>` needs
+no extra space.
 
-## Named indexes
+- `PersonId::new(index)` constructs an ID or panics on overflow.
+- `PersonId::try_new(index)` returns `Option<PersonId>`.
+- `id.index()` and `usize::from(id)` return the zero-based index.
+- `PersonId::try_from(index)` provides fallible conversion from `usize`.
 
-Declare named indexes on a struct to combine fields or compute keys:
+Generated IDs implement `Debug`, `Copy`, `Clone`, equality, ordering, and hashing.
+A `u8` ID permits 255 slots; capacity exhaustion panics before insertion changes
+the table. IDs are local to a table instance. Removed slots are reused, so an old
+ID can later refer to a different row.
+
+## Generics and table options
+
+Table parameters and bounds are shared by their extractors:
 
 ```rust
-#[microtable::table]
-#[index(name = tenant_email, unique, fields(tenant, email))]
-#[index(name = tenant_team, many, fields(tenant, team))]
-#[index(name = normalized_email, unique, key_type = String,
-        key = |row| format!("{}:{}", row.tenant, row.email.to_ascii_lowercase()))]
-#[derive(Debug)]
-struct Account {
-    tenant: u32,
-    email: String,
-    team: String,
+microtable::table! {
+    struct Values<T>([T]) where T: Eq + std::hash::Hash;
+
+    #[index(unique)]
+    fn value(row: &T) -> &T { row }
 }
 
-let mut accounts = AccountTable::new();
-let id = accounts.insert(Account {
-    tenant: 1,
-    email: "Ada@example.com".into(),
-    team: "engineering".into(),
-}).unwrap();
-assert_eq!(accounts.get_by_tenant_email(&1, "Ada@example.com").unwrap().0, id);
-assert_eq!(accounts.iter_by_tenant_team(&1, "engineering").count(), 1);
-assert_eq!(accounts.get_by_normalized_email("1:ada@example.com").unwrap().0, id);
+let values = Values::<String>::new();
+assert!(values.is_empty());
 ```
 
-Named indexes support both `unique` and `many`, and coexist with field attributes.
-For structs, names must be distinct from every other index name, including field indexes.
-`fields(...)` accepts one or more distinct field names. Composite lookups take
-one borrowed argument per field, in the declared order.
+Lifetimes, const parameters, and external borrowed data are supported too.
 
-Field and composite indexes default to noncached storage; computed indexes
-default to cached storage. Both `#[indexed(unique, ...)]` /
-`#[indexed(many, ...)]` and `#[index(...)]` accept `cached` (equivalent to
-`cached = true`) or `cached = false`.
-
-Computed indexes require an explicit `key_type` and a `key` function path or
-non-capturing closure, coerced to `fn(&Row) -> Key`. The result needs only
-`Eq + Hash`, not `Clone`, even when cached: the key is moved into the map. Source
-fields need no additional bounds. Cached keys are computed once per attempted
-write that reaches validation and stored in the index map, not the row wrapper.
-Lookup, removal, and rehash do not rerun cached computations. Noncached computed
-keys are recomputed from stored rows for equality checks, lookups, and rehashing;
-these functions must be deterministic and must not panic. Keys may borrow data
-with an existing row lifetime, but cannot borrow from the row's owned fields.
-A computed tuple key is queried using a reference to that tuple.
-
-Insertion returns `Err((rejected_row, blocking_id))` for the first unique index
-conflict in validation order. The rejected row is returned to the caller, not
-dropped automatically. The blocking ID identifies the existing row. Unique
-conflicts leave the table and all indexes unchanged.
-Field indexes are validated in field order, then named indexes in declaration
-order. Enum indexes are validated in declaration order within the active variant.
-
-Structural capacity checks panic with `table capacity exhausted` after uniqueness
-checks and before table mutation. This means real storage or slot-index-space
-exhaustion, not a narrow-ID limit. Allocation failures can panic or abort; they
-are not returned as errors.
-
-Replacement errors expose the rejected `row` and a `kind`:
-`ReplaceErrorKind::Unique { field }` or `ReplaceErrorKind::NotFound`.
-For a named index, `field` contains the index name. Every returned replacement
-error leaves the table unchanged. Replacements can keep their own unique values.
-Using `unwrap()` on an insert result requires both `Row: Debug` and `Id: Debug`.
-Using `unwrap()` on a replacement result requires `Row: Debug`.
-
-## Hash builder
-
-Tables use `std::collections::hash_map::RandomState` by default. Select a different
-hash builder by type:
+Use `#[table(...)]` for append-only storage or a custom hash builder:
 
 ```rust
-#[microtable::table(
-    hasher = std::hash::BuildHasherDefault<std::collections::hash_map::DefaultHasher>
-)]
-struct Record {
-    #[indexed(unique)]
-    key: String,
+type HistoryHasher = std::hash::BuildHasherDefault<
+    std::collections::hash_map::DefaultHasher,
+>;
+
+microtable::table! {
+    #[table(append_only, hasher = HistoryHasher)]
+    struct ContactHistory([Person]);
+
+    #[index(many)]
+    fn email(person: &Person) -> &str { &person.email }
 }
 ```
 
-The type must implement `std::hash::BuildHasher + Clone + Default`. The table
-creates one shared builder with `Default` and clones it into cached index maps.
-Clones must produce equivalent hashes for the same keys. All noncached hashing,
-queries, and rehashing use the chosen builder too. This option works for structs,
-enums, mutable tables, and append-only tables. It accepts only a type, not an
-initializer; `new()` and `default()` remain the constructors.
+`append_only` uses dense storage and omits `remove` and `replace`. Hash builders
+must implement `BuildHasher + Clone + Default`; clones must produce equivalent
+hashes. The default is `RandomState`, which protects against hash collision
+attacks. Select custom hashers with care for untrusted input.
 
-The default builder protects against hash collision attacks. Deterministic or
-constant-hash test builders are not recommended for hostile input.
+Noncached extractors must be deterministic. Stored keys must keep stable hash
+and equality behavior, including through interior mutability. Consistency after
+a panic in user-defined extraction, hashing, or equality is not guaranteed.
+Conditional attributes on individual extractors are not supported.
 
-Indexes use `hashbrown`. Noncached indexes use `HashTable<Id>` and derive keys
-from rows. Cached indexes use
-`HashMap` and own their keys. Each cached key includes its representative row ID
-as metadata that does not affect hashing or equality. Each entry holds one row
-ID for a unique index or a representative ID for a many index. In mutable
-tables, per-row cached hashes support detaching cached index entries. Rows are
-detached from indexes before replacement or removal.
+## Development
 
-In mutable tables, each many index uses a doubly linked list with previous/next
-IDs in a private row wrapper, with independent links for each many index. There is no vector or
-set of IDs allocated for each value. Insert, remove, replace, and unique lookup
-take expected constant time per index, excluding key computation, hashing,
-equality, and cloning costs. A many lookup takes expected constant time to find
-the head, then constant time per matching row. Full-table iteration scans
-allocated slots, including holes. Iteration order is unspecified.
-
-Mutable rows occupy reusable slots maintained by a free list. Removing one row
-never shifts another row's ID. Occupancy is stored in a `bitvec` bitmap, using one bit
-per allocated slot. A slot is a union of the row and a one-word free-list link,
-so vacant slots do not reserve additional link space alongside a row. Unsafe
-union access is confined to the slot-storage module, which owns occupancy
-tracking and drops each live row exactly once, including cleanup after a row
-destructor panics.
-
-In mutable tables, an old ID can refer to a replacement row after slot reuse.
-
-IDs are local to a table instance: they carry no table-instance identifier and
-must not be used to address a different instance. Index keys must retain stable
-hash/equality behavior while stored, including through interior mutability.
-User-defined hashing, equality, and cloning should not panic; table consistency
-after a panic in those operations is not guaranteed.
-
-The API supports named-field structs with field, composite, and computed indexes,
-and single-field tuple enum variants with named computed indexes.
-Conditionally compiled fields are rejected. Serialization and mutable row
-references are outside the current API.
-
-Run the checks with `cargo test --workspace`, `cargo fmt --all --check`, and
-`cargo clippy --workspace --all-targets -- -D warnings`.
-
-The arena tests also pass with
-`MIRIFLAGS=-Zmiri-tree-borrows cargo +nightly miri test -p microtable --lib`.
-With `bitvec` 1.1.1, default Miri reports a Stacked Borrows violation inside
-`BitVec::push`, independently reproducible without an arena. Tree Borrows passes
-the arena tests, but `bitvec` still emits an integer-to-pointer provenance
-warning, which limits Miri's validation coverage.
+```sh
+cargo test --workspace
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+```
