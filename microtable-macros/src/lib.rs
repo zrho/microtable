@@ -472,7 +472,7 @@ fn validate_id(item: &syn::ItemStruct) -> syn::Result<()> {
     Ok(())
 }
 
-fn id_definition(item: &syn::ItemStruct, cfg: &[Tokens]) -> Tokens {
+fn id_definition(item: &syn::ItemStruct, cfg: &[Tokens], runtime: &Tokens) -> Tokens {
     let name = &item.ident;
     let vis = &item.vis;
     let attrs: Vec<_> = item
@@ -513,6 +513,11 @@ fn id_definition(item: &syn::ItemStruct, cfg: &[Tokens]) -> Tokens {
         }
         #(#cfg)*
         impl ::std::convert::From<#name> for usize { fn from(id: #name) -> usize { id.index() } }
+        #(#cfg)*
+        impl #runtime::__private::ArenaId for #name {
+            fn from_index(index: usize) -> Self { Self::new(index) }
+            fn into_index(self) -> usize { self.index() }
+        }
     }
 }
 
@@ -618,12 +623,9 @@ fn expand(declaration: Declaration) -> syn::Result<Tokens> {
             syn::parse_quote!(#name)
         })
         .unwrap_or_else(|| syn::parse_quote!(usize));
-    let id_def = id_item.as_ref().map(|item| id_definition(item, &cfg));
-    let (from, to) = if id_item.is_some() {
-        (quote!(#id::new), quote!(#id::index))
-    } else {
-        (quote!(|index| index), quote!(|id| id))
-    };
+    let id_def = id_item
+        .as_ref()
+        .map(|item| id_definition(item, &cfg, &runtime));
     let mut generics = table.generics.clone();
     generics.make_where_clause().predicates.push(syn::parse_quote!(#hasher: ::std::hash::BuildHasher + ::std::clone::Clone + ::std::default::Default));
     for index in &indexes {
@@ -758,7 +760,7 @@ fn expand(declaration: Declaration) -> syn::Result<Tokens> {
         #(#cfg)* impl #ig ::std::default::Default for #name #args #wc {
             fn default() -> Self {
                 let __hasher: #hasher = ::std::default::Default::default();
-                Self { __rows: #arena::new(#from, #to), #(#map_defaults,)* __hasher }
+                Self { __rows: #arena::new(), #(#map_defaults,)* __hasher }
             }
         }
         #(#cfg)* impl #ig #name #args #wc {

@@ -1,15 +1,25 @@
-use super::{AppendArena, Arena};
+use super::{AppendArena, Arena, ArenaId};
 use std::{cell::Cell, rc::Rc};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Id(pub usize);
 
+impl ArenaId for Id {
+    fn from_index(index: usize) -> Self {
+        Self(index ^ 0x5a5a)
+    }
+
+    fn into_index(self) -> usize {
+        self.0 ^ 0x5a5a
+    }
+}
+
 fn from_index(index: usize) -> Id {
-    Id(index ^ 0x5a5a)
+    Id::from_index(index)
 }
 
 fn to_index(id: Id) -> usize {
-    id.0 ^ 0x5a5a
+    id.into_index()
 }
 
 #[derive(Debug)]
@@ -32,7 +42,7 @@ fn counters(count: usize) -> Rc<Vec<Cell<usize>>> {
 
 #[test]
 fn reuse_and_sparse_iteration_across_bitmap_words() {
-    let mut arena = Arena::new(from_index, to_index);
+    let mut arena = Arena::<_, Id>::new();
     assert!(arena.is_empty());
     let ids: Vec<_> = (0..1024).map(|value| arena.insert(value)).collect();
     assert!(arena.can_insert());
@@ -61,7 +71,7 @@ fn reuse_and_sparse_iteration_across_bitmap_words() {
     assert_eq!(arena.len(), 1024);
     assert_eq!(arena.iter().count(), 1024);
 
-    let mut append = AppendArena::new(from_index, to_index);
+    let mut append = AppendArena::<_, Id>::new();
     assert!(append.is_empty());
     for index in 0..1024 {
         assert!(append.can_insert());
@@ -84,7 +94,7 @@ fn reuse_and_sparse_iteration_across_bitmap_words() {
 #[test]
 fn values_are_dropped_once_after_removal_reuse_and_arena_drop() {
     let drops = counters(171);
-    let mut arena = Arena::new(from_index, to_index);
+    let mut arena = Arena::<_, Id>::new();
     let ids: Vec<_> = (0..128)
         .map(|index| {
             arena.insert(Probe {
@@ -114,7 +124,7 @@ fn values_are_dropped_once_after_removal_reuse_and_arena_drop() {
 #[test]
 fn growth_preserves_ownership_and_slot_can_be_reused() {
     let drops = counters(1025);
-    let mut arena = Arena::new(from_index, to_index);
+    let mut arena = Arena::<_, Id>::new();
     let ids: Vec<_> = (0..1024)
         .map(|index| {
             arena.insert(Probe {
@@ -143,7 +153,7 @@ fn growth_preserves_ownership_and_slot_can_be_reused() {
 #[test]
 fn destructor_panic_still_drops_remaining_values() {
     let drops = counters(8);
-    let mut arena = Arena::new(from_index, to_index);
+    let mut arena = Arena::<_, Id>::new();
     for index in 0..8 {
         arena.insert(Probe {
             index,
@@ -158,7 +168,7 @@ fn destructor_panic_still_drops_remaining_values() {
 
 #[test]
 fn zero_sized_values_and_overaligned_values() {
-    let mut arena = Arena::<(), Id>::new(from_index, to_index);
+    let mut arena = Arena::<(), Id>::new();
     let a = arena.insert(());
     let b = arena.insert(());
     assert_eq!(arena.remove(a), Some(()));
@@ -166,7 +176,7 @@ fn zero_sized_values_and_overaligned_values() {
     assert_eq!(to_index(a), to_index(c));
     assert_eq!(arena.iter().count(), 2);
     assert_eq!(arena.get(b), Some(&()));
-    let mut append = AppendArena::<(), Id>::new(from_index, to_index);
+    let mut append = AppendArena::<(), Id>::new();
     for index in 0..1024 {
         assert!(append.can_insert());
         assert_eq!(to_index(append.next_id()), index);
@@ -179,7 +189,7 @@ fn zero_sized_values_and_overaligned_values() {
     #[derive(Debug)]
     #[repr(align(128))]
     struct Aligned([u8; 3]);
-    let mut arena = Arena::new(from_index, to_index);
+    let mut arena = Arena::<_, Id>::new();
     let id = arena.insert(Aligned([1, 2, 3]));
     assert_eq!(arena.get(id).unwrap().0, [1, 2, 3]);
     assert_eq!((arena.get(id).unwrap() as *const Aligned).addr() % 128, 0);

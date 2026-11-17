@@ -1,27 +1,33 @@
 //! Dense storage for rows that are never removed or replaced.
 
+use super::ArenaId;
+use std::marker::PhantomData;
+
 pub struct AppendArena<T, Id> {
     values: Vec<T>,
-    from_index: fn(usize) -> Id,
-    to_index: fn(Id) -> usize,
+    id: PhantomData<Id>,
 }
 
 impl<T: Clone, Id> Clone for AppendArena<T, Id> {
     fn clone(&self) -> Self {
         Self {
             values: self.values.clone(),
-            from_index: self.from_index,
-            to_index: self.to_index,
+            id: PhantomData,
         }
     }
 }
 
-impl<T, Id: Copy> AppendArena<T, Id> {
-    pub fn new(from_index: fn(usize) -> Id, to_index: fn(Id) -> usize) -> Self {
+impl<T, Id: ArenaId> Default for AppendArena<T, Id> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T, Id: ArenaId> AppendArena<T, Id> {
+    pub fn new() -> Self {
         Self {
             values: Vec::new(),
-            from_index,
-            to_index,
+            id: PhantomData,
         }
     }
 
@@ -39,7 +45,7 @@ impl<T, Id: Copy> AppendArena<T, Id> {
     }
 
     pub fn next_id(&self) -> Id {
-        (self.from_index)(self.values.len())
+        Id::from_index(self.values.len())
     }
 
     pub fn reserve(&mut self, additional: usize) {
@@ -54,17 +60,17 @@ impl<T, Id: Copy> AppendArena<T, Id> {
     }
 
     pub fn get(&self, id: Id) -> Option<&T> {
-        self.values.get((self.to_index)(id))
+        self.values.get(id.into_index())
     }
 
     pub fn get_mut(&mut self, id: Id) -> Option<&mut T> {
-        self.values.get_mut((self.to_index)(id))
+        self.values.get_mut(id.into_index())
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (Id, &T)> {
         self.values
             .iter()
             .enumerate()
-            .map(|(index, value)| ((self.from_index)(index), value))
+            .map(|(index, value)| (Id::from_index(index), value))
     }
 }

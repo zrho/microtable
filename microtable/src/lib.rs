@@ -34,7 +34,7 @@ impl<T: std::fmt::Debug> std::error::Error for ReplaceError<T> {}
 /// Implementation details used by generated code; not a stable public API.
 #[doc(hidden)]
 pub mod __private {
-    pub use crate::arena::{AppendArena, Arena};
+    pub use crate::arena::{AppendArena, Arena, ArenaId};
     pub use hashbrown::hash_map::RawEntryMut;
     pub use hashbrown::{HashMap, HashTable};
 

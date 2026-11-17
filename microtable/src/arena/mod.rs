@@ -1,10 +1,26 @@
-//! Stable row storage with caller-provided ID conversions.
+//! Stable row storage with statically dispatched ID conversions.
 
 pub use append::AppendArena;
 
 mod append;
 
 use slots::Slots;
+use std::marker::PhantomData;
+
+pub trait ArenaId: Copy {
+    fn from_index(index: usize) -> Self;
+    fn into_index(self) -> usize;
+}
+
+impl ArenaId for usize {
+    fn from_index(index: usize) -> Self {
+        index
+    }
+
+    fn into_index(self) -> usize {
+        self
+    }
+}
 
 // The union's active variant is controlled exclusively by Slots' occupancy bits.
 // All unsafe code is confined to this module; Arena uses its safe interface.
@@ -13,26 +29,29 @@ mod slots;
 
 pub struct Arena<T, Id> {
     slots: Slots<T>,
-    from_index: fn(usize) -> Id,
-    to_index: fn(Id) -> usize,
+    id: PhantomData<Id>,
 }
 
 impl<T: Clone, Id> Clone for Arena<T, Id> {
     fn clone(&self) -> Self {
         Self {
             slots: self.slots.clone(),
-            from_index: self.from_index,
-            to_index: self.to_index,
+            id: PhantomData,
         }
     }
 }
 
-impl<T, Id: Copy> Arena<T, Id> {
-    pub fn new(from_index: fn(usize) -> Id, to_index: fn(Id) -> usize) -> Self {
+impl<T, Id: ArenaId> Default for Arena<T, Id> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T, Id: ArenaId> Arena<T, Id> {
+    pub fn new() -> Self {
         Self {
             slots: Slots::default(),
-            from_index,
-            to_index,
+            id: PhantomData,
         }
     }
 
@@ -45,7 +64,7 @@ impl<T, Id: Copy> Arena<T, Id> {
     }
 
     pub fn next_id(&self) -> Id {
-        (self.from_index)(self.slots.next_index())
+        Id::from_index(self.slots.next_index())
     }
 
     // Structural capacity only; allocation failure is not recoverable here.
@@ -61,21 +80,21 @@ impl<T, Id: Copy> Arena<T, Id> {
     }
 
     pub fn get(&self, id: Id) -> Option<&T> {
-        self.slots.get((self.to_index)(id))
+        self.slots.get(id.into_index())
     }
 
     pub fn get_mut(&mut self, id: Id) -> Option<&mut T> {
-        self.slots.get_mut((self.to_index)(id))
+        self.slots.get_mut(id.into_index())
     }
 
     pub fn remove(&mut self, id: Id) -> Option<T> {
-        self.slots.remove((self.to_index)(id))
+        self.slots.remove(id.into_index())
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (Id, &T)> {
         self.slots
             .iter()
-            .map(|(index, value)| ((self.from_index)(index), value))
+            .map(|(index, value)| (Id::from_index(index), value))
     }
 }
 
